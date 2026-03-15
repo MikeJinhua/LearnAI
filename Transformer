@@ -1,0 +1,10 @@
+import torch
+import torch.nn as nn
+
+linear = nn.Linear(4096,4096).cuda()
+
+x = torch.randn(1,4096).cuda()
+
+y = linear(x)
+
+print(y.shape)
