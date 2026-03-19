@@ -1,5 +1,6 @@
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 import torch
+import time
 
 # ------------------------------------------------
 # 1️⃣ 加载 tokenizer
@@ -28,7 +29,7 @@ model.eval()
 # 只计算一个 token 的生成
 # ------------------------------------------------
 def forward_one_step(model, input_ids, past_key_values):
-
+    t0 = time.perf_counter()
     # torch.no_grad()
     # 表示关闭梯度计算
     # 推理时不需要反向传播
@@ -45,7 +46,11 @@ def forward_one_step(model, input_ids, past_key_values):
             # 告诉模型返回新的 KV cache
             use_cache=True
         )
-
+    ms = (time.perf_counter() - t0) * 1000
+    
+    seq_len = input_ids.shape[1]
+    print(f"{'Prefill' if past_key_values is None else 'Decode ':7s} | "
+          f"input tokens: {seq_len:4d} | {ms:.1f} ms")
     # outputs.logits shape:
     #
     # [batch, seq_len, vocab_size]
@@ -101,9 +106,10 @@ def generate(model, tokenizer, prompt, max_new_tokens=80):
 
         # 只输入最后一个 token
         # 因为之前 token 已经在 KV cache 中
+        cur_input = input_ids if past is None else input_ids[:, -1:]
         next_token, past = forward_one_step(
             model,
-            input_ids[:, -1:],
+            cur_input,
             past
         )
 
@@ -117,3 +123,14 @@ def generate(model, tokenizer, prompt, max_new_tokens=80):
     # token ids -> 文本
     # ------------------------------------------------
     return tokenizer.decode(input_ids[0])
+
+
+
+# ------------------------------------------------
+# 6️⃣ 调用测试
+# ------------------------------------------------
+if __name__ == "__main__":
+    prompt = "The future of artificial intelligence is"
+    print(f"Prompt: {prompt}\n")
+    result = generate(model, tokenizer, prompt, max_new_tokens=50)
+    print(f"Generated:\n{result}")
