@@ -22,6 +22,13 @@ model = GPT2LMHeadModel.from_pretrained("gpt2")
 # 切换到推理模式
 model.eval()
 
+# ------------------------------------------------
+# 检测 CUDA，自动选择 GPU/CPU
+# ------------------------------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+model = model.to(device)
+
 
 
 # ------------------------------------------------
@@ -91,7 +98,7 @@ def generate(model, tokenizer, prompt, max_new_tokens=80):
     # ↓
     # [15496, 995]
     # ------------------------------------------------
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
     # KV cache 初始为空
     past = None
