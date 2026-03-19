@@ -1,5 +1,12 @@
 # Virtual environment
 ai/
+venv/
+
+# Claude Code
+.claude/
+
+# Binaries
+*.exe
 
 # macOS
 .DS_Store
