@@ -75,8 +75,9 @@ def prefill(model, input_ids):
     next_token = sample(outputs.logits[:, -1, :])
     kv_cache = outputs.past_key_values
 
-    num_layers = len(kv_cache)
-    k_shape = kv_cache[0][0].shape
+    cache_list = list(kv_cache)
+    num_layers = len(cache_list)
+    k_shape = cache_list[0][0].shape
     print(f"  KV Cache: {num_layers} 层，每层 K/V shape = {list(k_shape)}")
     print(f"  seq_len = {k_shape[2]}（等于 prompt 长度）")
 
@@ -143,7 +144,7 @@ def generate(prompt, max_new_tokens=20):
         generated_tokens.append(token)
         decode_latencies.append(decode_ms)
 
-        seq_len = kv_cache[0][0].shape[2]
+        seq_len = list(kv_cache)[0][0].shape[2]
         word = tokenizer.decode(token[0])
         print(f"  Step {step:2d} | token: {word!r:12s} | "
               f"KV seq_len: {seq_len:4d} | latency: {decode_ms:.1f} ms")
