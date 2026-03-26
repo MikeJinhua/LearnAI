@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <math.h>
+#include <float.h>
 
 // -------------------------------------------------------
 // Naive Softmax: 每个 thread 负责一整行
@@ -32,6 +33,39 @@ __global__ void softmax_naive(float* input, float* output, int M, int N) {
         y[i] = expf(x[i] - max_val) / sum;
     }
 }
+
+__global__ void softmax_v2(float* input, float* output, int M, int N) {
+    __shared__ float smem[256];  // shared memory
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= M) return;
+
+    float* x = input  + row * N;
+    float* y = output + row * N;
+
+    // Step 1: 每个 thread 先算自己负责的元素的局部 max
+    float local_max = -FLT_MAX;
+    for (int i = tid; i < N; i += blockDim.x) {
+        local_max = fmaxf(local_max, x[i]);
+    }
+    smem[tid] = local_max;
+    __syncthreads();
+
+    // Step 2: 树形归约找全行 max
+    // ??? 这里你来填
+
+    // Step 3: 每个 thread 算局部 sum（exp）
+    // ???
+
+    // Step 4: 树形归约找全行 sum
+    // ???
+
+    // Step 5: normalize 写回
+    float max_val = smem[0];  // 归约结果在 smem[0]
+    // ???
+}
+
 
 // -------------------------------------------------------
 // CPU 参考实现，用来验证正确性
@@ -75,6 +109,7 @@ int main() {
     float* h_output = new float[total];
 
     // 随机初始化
+    
     for (int i = 0; i < total; i++) h_input[i] = (float)rand() / RAND_MAX * 10.0f - 5.0f;
 
     // CPU 参考
