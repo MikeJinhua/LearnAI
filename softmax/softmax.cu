@@ -34,8 +34,69 @@ __global__ void softmax_naive(float* input, float* output, int M, int N) {
     }
 }
 
+__global__ void softmax_v3(float* input, float* output, int M, int N) {
+    __shared__ float smem_max[256];
+    __shared__ float smem_sum[256];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= M) return;
+
+    float* x = input  + row * N;
+    float* y = output + row * N;
+
+    // Step 1: 每个 thread 扫自己的元素，同时维护局部 max 和 sum
+    float local_max = -FLT_MAX;
+    float local_sum = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+        float val = x[i];
+        if (val > local_max) {
+            
+        // max 更新了，sum 需要修正
+        local_sum = local_sum * expf(local_max - val) + 1.0f;  // +1 是因为 exp(val-val)=1
+        local_max = val;
+        } else {
+            // max 没变，直接累加
+            local_sum += expf(val - local_max);  // 直接加，不除
+        }
+    }
+    smem_max[tid] = local_max;
+    smem_sum[tid] = local_sum;
+    __syncthreads();
+
+    // Step 2: 树形归约，同时归约 max 和 sum
+    // 注意：合并两个 thread 的 (max, sum) 时，也要用修正公式
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float m_a = smem_max[tid];
+            float m_b = smem_max[tid + stride];
+            float s_a = smem_sum[tid];
+            float s_b = smem_sum[tid + stride];
+            // ??? 合并 (m_a, s_a) 和 (m_b, s_b)
+            if (m_a > m_b) {
+                
+                // max 更新了，sum 需要修正
+                smem_max[tid] = m_a;
+                smem_sum[tid] = s_a + s_b * expf(m_b - m_a);
+            } else {
+                // max 没变，直接累加
+                smem_max[tid] = m_b;
+                smem_sum[tid] = s_b + s_a * expf(m_a - m_b);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Step 3: normalize 写回
+    float max_val = smem_max[0];
+    float sum_val = smem_sum[0];
+    for (int i = tid; i < N; i += blockDim.x) {
+        y[i] = expf(x[i] - max_val) / sum_val;
+    }
+}
+
 __global__ void softmax_v2(float* input, float* output, int M, int N) {
-    __shared__ float smem[256];  // shared memory
+     __shared__ float smem[256];  // shared memory
 
     int row = blockIdx.x;
     int tid = threadIdx.x;
@@ -53,17 +114,36 @@ __global__ void softmax_v2(float* input, float* output, int M, int N) {
     __syncthreads();
 
     // Step 2: 树形归约找全行 max
-    // ??? 这里你来填
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        }
+        __syncthreads();
+    }
 
+    float  max_val = smem[0];
+   
+     __syncthreads();
+    smem[tid] = 0;
     // Step 3: 每个 thread 算局部 sum（exp）
-    // ???
-
+    float local_sum = 0;
+    for (int i = tid; i < N; i += blockDim.x) {
+         local_sum += expf(x[i] - max_val);
+    }
+    smem[tid] = local_sum;
+    __syncthreads();
     // Step 4: 树形归约找全行 sum
-    // ???
-
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] = smem[tid] + smem[tid + stride];
+        }
+        __syncthreads();
+    }
+ 
     // Step 5: normalize 写回
-    float max_val = smem[0];  // 归约结果在 smem[0]
-    // ???
+     for (int i = tid; i < N; i += blockDim.x) {
+        y[i] = expf(x[i] - max_val) / smem[0];
+    }
 }
 
 
@@ -147,6 +227,34 @@ int main() {
     float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
     printf("⏱  Naive: %.3f ms (avg over 100 runs)\n", ms / 100.0f);
+
+    // V2 验证
+    softmax_v2<<<M, 256>>>(d_input, d_output, M, N);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_output, d_output, total * sizeof(float), cudaMemcpyDeviceToHost);
+    if (verify(h_ref, h_output, total)) printf("✅ V2 softmax correct!\n");
+
+    // V2 计时
+    cudaEventRecord(start);
+    for (int i = 0; i < 100; i++)
+        softmax_v2<<<M, 256>>>(d_input, d_output, M, N);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("⏱  V2: %.3f ms (avg over 100 runs)\n", ms / 100.0f);
+
+    softmax_v3<<<M, 256>>>(d_input, d_output, M, N);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_output, d_output, total * sizeof(float), cudaMemcpyDeviceToHost);
+    if (verify(h_ref, h_output, total)) printf("✅ V3 softmax correct!\n");
+
+    cudaEventRecord(start);
+    for (int i = 0; i < 100; i++)
+        softmax_v3<<<M, 256>>>(d_input, d_output, M, N);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("⏱  V3: %.3f ms (avg over 100 runs)\n", ms / 100.0f);
 
     // Cleanup
     delete[] h_input; delete[] h_ref; delete[] h_output;
