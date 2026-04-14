@@ -115,6 +115,9 @@ __global__ void flash_attn_kernel(
     // 每个 block 负责一个 Q 的 tile
     int tile_row = blockIdx.x * BLOCK_SIZE;
     int tid = threadIdx.x;
+    int q_row = tile_row + tid;
+
+    if (q_row >= seq_len) return;
 
     // 申请 shared memory
     extern __shared__ float smem[];
@@ -122,25 +125,45 @@ __global__ void flash_attn_kernel(
     float* Kj = Qi + BLOCK_SIZE * head_dim;    // [block_size, head_dim]
     float* Vj = Kj + BLOCK_SIZE * head_dim;    // [block_size, head_dim]
 
+    // 整个 block 协作把当前 Q tile 搬到 shared memory。
+    // 每个线程逻辑上负责 tile 里的一行 Q。
+    for (int idx = tid; idx < BLOCK_SIZE * head_dim; idx += blockDim.x) {
+        int row = idx / head_dim;
+        int col = idx % head_dim;
+        int global_row = tile_row + row;
+        Qi[idx] = (global_row < seq_len) ? Q[global_row * head_dim + col] : 0.0f;
+    }
+    __syncthreads();
+
     // 初始化 m, l, O
     float m = -FLT_MAX;
     float l = 0.0f;
-    // O 初始化为 0
-    for (int i = tid; i < head_dim; i += blockDim.x) {
-        O[tile_row * head_dim + i] = 0.0f;
+    // 每个线程初始化自己负责的那一行输出。
+    for (int d = 0; d < head_dim; d++) {
+        O[q_row * head_dim + d] = 0.0f;
     }
 
     // 外层循环：遍历所有 K/V 块
     for (int j = 0; j < seq_len; j += BLOCK_SIZE) {
 
-        // 把 Kj, Vj 从 global memory 加载到 shared memory
+        // 整个 block 协作把当前 K/V tile 搬到 shared memory
+        for (int idx = tid; idx < BLOCK_SIZE * head_dim; idx += blockDim.x) {
+            int row = idx / head_dim;
+            int col = idx % head_dim;
+            int global_row = j + row;
+            Kj[idx] = (global_row < seq_len) ? K[global_row * head_dim + col] : 0.0f;
+            Vj[idx] = (global_row < seq_len) ? V[global_row * head_dim + col] : 0.0f;
+        }
+        __syncthreads();
+
+        // 计算当前线程这行 Q 和当前 K tile 的分数块 Sij
+        // TODO: 用 Qi[tid * head_dim + d] 和 Kj[row * head_dim + d] 做点积
         // ???
 
-        // 计算 Sij = Qi × Kj^T
+        // TODO: 用 online softmax 更新当前线程这行的 m, l, O
         // ???
 
-        // online softmax 更新 m, l, O
-        // ???
+        __syncthreads();
     }
 }
 
