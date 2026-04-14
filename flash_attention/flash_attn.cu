@@ -33,6 +33,76 @@ const int BLOCK_SIZE = 16; // tile 大小
 // Grid:  (SEQ_LEN / BLOCK_SIZE,)  — 每个 block 负责 Q 的一个 tile
 // Block: (BLOCK_SIZE,)
 // -------------------------------------------------------
+// -------------------------------------------------------
+// 普通 GPU Attention（三个 kernel，不做 tiling 优化）
+// -------------------------------------------------------
+
+// Kernel 1: S = Q @ K^T * scale
+// Grid:  (seq_len/16, seq_len/16)  Block: (16, 16)
+// 线程 (i, j) 负责计算 S[i][j]
+__global__ void qk_dot_kernel(
+    const float* Q, const float* K, float* S,
+    int seq_len, int head_dim, float scale
+) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= seq_len || j >= seq_len) return;
+
+    float val = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        val += Q[i * head_dim + d] * K[j * head_dim + d];
+    }
+    S[i * seq_len + j] = val * scale;
+}
+
+// Kernel 2: softmax over each row
+// Grid:  (seq_len,)  Block: (1,)
+// 每个线程独立处理一整行（seq_len 小时够用）
+__global__ void softmax_kernel(float* S, int seq_len) {
+    int i = blockIdx.x;
+    if (i >= seq_len) return;
+
+    float* row = S + i * seq_len;
+
+    // 找最大值（数值稳定）
+    float max_val = -FLT_MAX;
+    for (int j = 0; j < seq_len; j++)
+        max_val = fmaxf(max_val, row[j]);
+
+    // exp 并求和
+    float sum = 0.0f;
+    for (int j = 0; j < seq_len; j++) {
+        row[j] = expf(row[j] - max_val);
+        sum += row[j];
+    }
+
+    // 归一化
+    for (int j = 0; j < seq_len; j++)
+        row[j] /= sum;
+}
+
+// Kernel 3: O = S @ V
+// Grid:  (head_dim/16, seq_len/16)  Block: (16, 16)
+// 线程 (i, d) 负责计算 O[i][d]
+__global__ void sv_dot_kernel(
+    const float* S, const float* V, float* O,
+    int seq_len, int head_dim
+) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= seq_len || d >= head_dim) return;
+
+    float val = 0.0f;
+    for (int j = 0; j < seq_len; j++) {
+        val += S[i * seq_len + j] * V[j * head_dim + d];
+    }
+    O[i * head_dim + d] = val;
+}
+
+
+// -------------------------------------------------------
+// Flash Attention kernel（TODO）
+// -------------------------------------------------------
 __global__ void flash_attn_kernel(
     const float* Q,
     const float* K,
@@ -170,16 +240,32 @@ int main() {
     cudaMemcpy(d_K, h_K, total * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V, total * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Launch（TODO: 填完 kernel 后取消注释）
-    // int grid  = SEQ_LEN / BLOCK_SIZE;
-    // int block = BLOCK_SIZE;
-    // flash_attn_kernel<<<grid, block>>>(d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale);
-    // cudaDeviceSynchronize();
+    // -------------------------------------------------------
+    // 普通 GPU Attention
+    // -------------------------------------------------------
+    float* d_S;
+    cudaMalloc(&d_S, SEQ_LEN * SEQ_LEN * sizeof(float));
 
-    // cudaMemcpy(h_out, d_O, total * sizeof(float), cudaMemcpyDeviceToHost);
-    // if (verify(h_ref, h_out, total)) printf("✅ Flash Attention correct!\n");
+    dim3 block2d(16, 16);
+    dim3 grid_qk(SEQ_LEN / 16, SEQ_LEN / 16);   // Kernel 1
+    dim3 grid_sv(HEAD_DIM / 16, SEQ_LEN / 16);  // Kernel 3
 
-    printf("骨架搭好了，开始填 TODO 吧！\n");
+    // Kernel 1: S = Q @ K^T * scale
+    qk_dot_kernel<<<grid_qk, block2d>>>(d_Q, d_K, d_S, SEQ_LEN, HEAD_DIM, scale);
+
+    // Kernel 2: softmax over each row
+    softmax_kernel<<<SEQ_LEN, 1>>>(d_S, SEQ_LEN);
+
+    // Kernel 3: O = S @ V
+    sv_dot_kernel<<<grid_sv, block2d>>>(d_S, d_V, d_O, SEQ_LEN, HEAD_DIM);
+
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_out, d_O, total * sizeof(float), cudaMemcpyDeviceToHost);
+
+    if (verify(h_ref, h_out, total))
+        printf("普通 GPU Attention: PASS\n");
+
+    cudaFree(d_S);
 
     // Cleanup
     delete[] h_Q; delete[] h_K; delete[] h_V; delete[] h_ref; delete[] h_out;
