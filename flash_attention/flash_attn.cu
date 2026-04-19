@@ -30,15 +30,20 @@ const int BLOCK_SIZE = 16; // tile 大小
 // 输出：
 //   O        shape: [SEQ_LEN, HEAD_DIM]
 //
-// Grid:  (SEQ_LEN / BLOCK_SIZE,)  — 每个 block 负责 Q 的一个 tile
-// Block: (BLOCK_SIZE,)
+// Grid:  (ceil_div(seq_len, BLOCK_SIZE),)  — 每个 block 负责 Q 的一个 tile
+// Block: (BLOCK_SIZE,)                     — 这版实现要求 blockDim.x == BLOCK_SIZE
+// Smem:  3 * BLOCK_SIZE * HEAD_DIM * sizeof(float)
+//
+// 注意：
+// 1) 这版 demo 把 HEAD_DIM 固定成编译期常量，要求传入的 head_dim == HEAD_DIM。
+// 2) O 的中间状态保存在寄存器里，所有 K/V tile 处理完后再一次性写回全局内存。
 // -------------------------------------------------------
 // -------------------------------------------------------
 // 普通 GPU Attention（三个 kernel，不做 tiling 优化）
 // -------------------------------------------------------
 
 // Kernel 1: S = Q @ K^T * scale
-// Grid:  (seq_len/16, seq_len/16)  Block: (16, 16)
+// Grid:  (ceil_div(seq_len,16), ceil_div(seq_len,16))  Block: (16, 16)
 // 线程 (i, j) 负责计算 S[i][j]
 __global__ void qk_dot_kernel(
     const float* Q, const float* K, float* S,
@@ -82,7 +87,7 @@ __global__ void softmax_kernel(float* S, int seq_len) {
 }
 
 // Kernel 3: O = S @ V
-// Grid:  (head_dim/16, seq_len/16)  Block: (16, 16)
+// Grid:  (ceil_div(head_dim,16), ceil_div(seq_len,16))  Block: (16, 16)
 // 线程 (i, d) 负责计算 O[i][d]
 __global__ void sv_dot_kernel(
     const float* S, const float* V, float* O,
@@ -101,7 +106,7 @@ __global__ void sv_dot_kernel(
 
 
 // -------------------------------------------------------
-// Flash Attention kernel（TODO）
+// Flash Attention kernel（online softmax 简化版）
 // -------------------------------------------------------
 __global__ void flash_attn_kernel(
     const float* Q,
@@ -112,21 +117,131 @@ __global__ void flash_attn_kernel(
     int head_dim,
     float scale  // = 1 / sqrt(head_dim)
 ) {
+    // 这版 kernel 把每个线程绑定到一行 Q，并把 O 暂存在寄存器里，
+    // 因此要求 launch 时使用固定的线程数和 head_dim。
+    if (blockDim.x != BLOCK_SIZE || head_dim != HEAD_DIM) return;
+
     // 每个 block 负责一个 Q 的 tile
     int tile_row = blockIdx.x * BLOCK_SIZE;
     int tid = threadIdx.x;
     int q_row = tile_row + tid;
-
-    if (q_row >= seq_len) return;
+    bool active = (q_row < seq_len);
 
     // 申请 shared memory
     extern __shared__ float smem[];
     float* Qi = smem;                          // [block_size, head_dim]
-    float* Kj = Qi + BLOCK_SIZE * head_dim;    // [block_size, head_dim]
-    float* Vj = Kj + BLOCK_SIZE * head_dim;    // [block_size, head_dim]
+    float* Kj = Qi + BLOCK_SIZE * HEAD_DIM;    // [block_size, head_dim]
+    float* Vj = Kj + BLOCK_SIZE * HEAD_DIM;    // [block_size, head_dim]
 
-    // 整个 block 协作把当前 Q tile 搬到 shared memory。
-    // 每个线程逻辑上负责 tile 里的一行 Q。
+    // 把当前 q_row 的输出累积在寄存器里，最后一次性写回全局内存。
+    float o_reg[HEAD_DIM];
+#pragma unroll
+    for (int d = 0; d < HEAD_DIM; d++) {
+        o_reg[d] = 0.0f;
+    }
+
+    // 加载 Q tile 到 shared memory（SRAM 是 block 内所有线程共享的）
+    // 具体哪个线程加载哪个元素无所谓，只要把 BLOCK_SIZE 行的数据都搬进来即可
+    // 用步长循环让所有 16 个线程合作加载 1024 个元素，提高内存带宽利用率
+    for (int idx = tid; idx < BLOCK_SIZE * HEAD_DIM; idx += blockDim.x) {
+        int row = idx / HEAD_DIM;
+        int col = idx % HEAD_DIM;
+        int global_row = tile_row + row;
+        Qi[idx] = (global_row < seq_len) ? Q[global_row * HEAD_DIM + col] : 0.0f;
+    }
+    __syncthreads();  // 确保所有数据都加载完成，之后所有线程都能访问完整的 Qi tile
+
+    // 初始化 m, l, O
+    float m = -FLT_MAX;
+    float l = 0.0f;
+
+    // 外层循环：遍历所有 K/V 块
+    for (int j = 0; j < seq_len; j += BLOCK_SIZE) {
+
+        // 加载当前 K/V tile 到 shared memory（同样是所有线程协作加载，具体分配无所谓）
+        for (int idx = tid; idx < BLOCK_SIZE * HEAD_DIM; idx += blockDim.x) {
+            int row = idx / HEAD_DIM;
+            int col = idx % HEAD_DIM;
+            int global_row = j + row;
+            Kj[idx] = (global_row < seq_len) ? K[global_row * HEAD_DIM + col] : 0.0f;
+            Vj[idx] = (global_row < seq_len) ? V[global_row * HEAD_DIM + col] : 0.0f;
+        }
+        __syncthreads();  // 数据准备完成，所有线程可以安全地访问 Kj 和 Vj
+
+        // 当前线程负责 q_row 这一行
+        if (active) {
+            for (int row = 0; row < BLOCK_SIZE; row++) {
+                int k_row = j + row;
+                if (k_row >= seq_len) continue;
+
+                // 1) 计算当前 score = Q[q_row] · K[k_row]
+                float score = 0.0f;
+#pragma unroll
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    score += Qi[tid * HEAD_DIM + d] * Kj[row * HEAD_DIM + d];
+                }
+                score *= scale;
+
+                // 2) online softmax 更新
+                float m_new = fmaxf(m, score);
+                float exp_old = expf(m - m_new);
+                float exp_new = expf(score - m_new);
+                float l_new = l * exp_old + exp_new;
+
+                // 3) 更新输出 O[q_row, :]
+#pragma unroll
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    float v = Vj[row * HEAD_DIM + d];
+                    o_reg[d] = (o_reg[d] * l * exp_old + v * exp_new) / l_new;
+                }
+
+                // 4) 更新状态
+                m = m_new;
+                l = l_new;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (active) {
+#pragma unroll
+        for (int d = 0; d < HEAD_DIM; d++) {
+            O[q_row * HEAD_DIM + d] = o_reg[d];
+        }
+    }
+}
+
+// -------------------------------------------------------
+// Flash Attention v2 骨架（仅结构，不含完整实现）
+//
+// 思路（和 v1 的区别）：
+// 1) 依然按 Q/K/V tile 流式处理
+// 2) 更强调在 block/warp 内做并行归约（max/sum）
+// 3) 尽量把中间量留在寄存器，减少对全局内存读写
+// -------------------------------------------------------
+__global__ void flash_attn_v2_kernel_skeleton(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    int seq_len,
+    int head_dim,
+    float scale
+) {
+    int tile_row = blockIdx.x * BLOCK_SIZE;
+    int tid = threadIdx.x;
+    int q_row = tile_row + tid;
+    bool active = (q_row < seq_len);
+
+    extern __shared__ float smem[];
+    float* Qi = smem;
+    float* Kj = Qi + BLOCK_SIZE * head_dim;
+    float* Vj = Kj + BLOCK_SIZE * head_dim;
+
+    // TODO(v2): 也可以把 O 的部分累积放到寄存器数组，最后一次性写回。
+
+    // 1) 载入当前 Q tile
     for (int idx = tid; idx < BLOCK_SIZE * head_dim; idx += blockDim.x) {
         int row = idx / head_dim;
         int col = idx % head_dim;
@@ -135,18 +250,17 @@ __global__ void flash_attn_kernel(
     }
     __syncthreads();
 
-    // 初始化 m, l, O
+    // 2) 初始化在线 softmax 状态
     float m = -FLT_MAX;
     float l = 0.0f;
-    // 每个线程初始化自己负责的那一行输出。
-    for (int d = 0; d < head_dim; d++) {
-        O[q_row * head_dim + d] = 0.0f;
+    if (active) {
+        for (int d = 0; d < head_dim; d++) {
+            O[q_row * head_dim + d] = 0.0f;
+        }
     }
 
-    // 外层循环：遍历所有 K/V 块
+    // 3) 流式遍历所有 K/V tile
     for (int j = 0; j < seq_len; j += BLOCK_SIZE) {
-
-        // 整个 block 协作把当前 K/V tile 搬到 shared memory
         for (int idx = tid; idx < BLOCK_SIZE * head_dim; idx += blockDim.x) {
             int row = idx / head_dim;
             int col = idx % head_dim;
@@ -156,12 +270,15 @@ __global__ void flash_attn_kernel(
         }
         __syncthreads();
 
-        // 计算当前线程这行 Q 和当前 K tile 的分数块 Sij
-        // TODO: 用 Qi[tid * head_dim + d] 和 Kj[row * head_dim + d] 做点积
-        // ???
+        // TODO(v2-step1): 每个线程/warp 计算局部 score 片段。
+        // TODO(v2-step2): 对 score 在 block/warp 内做并行 max 归约，得到 m_tile。
+        // TODO(v2-step3): 对 exp(score - m_tile) 做并行 sum 归约，得到 l_tile。
+        // TODO(v2-step4): 用 m/l 与 m_tile/l_tile 合并，并并行累积 O。
 
-        // TODO: 用 online softmax 更新当前线程这行的 m, l, O
-        // ???
+        // 占位：避免 scale 参数未使用
+        if (active && scale < 0.0f) {
+            O[q_row * head_dim] = O[q_row * head_dim];
+        }
 
         __syncthreads();
     }
@@ -270,8 +387,8 @@ int main() {
     cudaMalloc(&d_S, SEQ_LEN * SEQ_LEN * sizeof(float));
 
     dim3 block2d(16, 16);
-    dim3 grid_qk(SEQ_LEN / 16, SEQ_LEN / 16);   // Kernel 1
-    dim3 grid_sv(HEAD_DIM / 16, SEQ_LEN / 16);  // Kernel 3
+    dim3 grid_qk((SEQ_LEN + 15) / 16, (SEQ_LEN + 15) / 16);  // Kernel 1
+    dim3 grid_sv((HEAD_DIM + 15) / 16, (SEQ_LEN + 15) / 16); // Kernel 3
 
     // Kernel 1: S = Q @ K^T * scale
     qk_dot_kernel<<<grid_qk, block2d>>>(d_Q, d_K, d_S, SEQ_LEN, HEAD_DIM, scale);
@@ -289,6 +406,25 @@ int main() {
         printf("普通 GPU Attention: PASS\n");
 
     cudaFree(d_S);
+
+    // -------------------------------------------------------
+    // Flash Attention
+    // -------------------------------------------------------
+    int grid_fa = (SEQ_LEN + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    size_t smem_size = 3 * BLOCK_SIZE * HEAD_DIM * sizeof(float);
+
+    flash_attn_kernel<<<grid_fa, BLOCK_SIZE, smem_size>>>(
+        d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale
+    );
+
+    cudaDeviceSynchronize();
+    float* h_out2 = new float[total];
+    cudaMemcpy(h_out2, d_O, total * sizeof(float), cudaMemcpyDeviceToHost);
+
+    if (verify(h_ref, h_out2, total))
+        printf("Flash Attention:    PASS\n");
+
+    delete[] h_out2;
 
     // Cleanup
     delete[] h_Q; delete[] h_K; delete[] h_V; delete[] h_ref; delete[] h_out;
