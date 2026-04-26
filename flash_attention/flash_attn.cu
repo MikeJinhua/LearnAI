@@ -18,9 +18,9 @@
 // -------------------------------------------------------
 
 // 超参数
-const int SEQ_LEN = 64;    // 序列长度（先用小值调通）
+const int SEQ_LEN = 4096;    // 序列长度（先用小值调通）
 const int HEAD_DIM = 64;   // 每个 head 的维度
-const int BLOCK_SIZE = 16; // tile 大小
+const int BLOCK_SIZE = 32; // tile 大小
 
 // -------------------------------------------------------
 // Kernel: Flash Attention（单个 head）
@@ -37,7 +37,6 @@ const int BLOCK_SIZE = 16; // tile 大小
 // 注意：
 // 1) 这版 demo 把 HEAD_DIM 固定成编译期常量，要求传入的 head_dim == HEAD_DIM。
 // 2) O 的中间状态保存在寄存器里，所有 K/V tile 处理完后再一次性写回全局内存。
-// -------------------------------------------------------
 // -------------------------------------------------------
 // 普通 GPU Attention（三个 kernel，不做 tiling 优化）
 // -------------------------------------------------------
@@ -141,8 +140,7 @@ __global__ void flash_attn_kernel(
     }
 
     // 加载 Q tile 到 shared memory（SRAM 是 block 内所有线程共享的）
-    // 具体哪个线程加载哪个元素无所谓，只要把 BLOCK_SIZE 行的数据都搬进来即可
-    // 用步长循环让所有 16 个线程合作加载 1024 个元素，提高内存带宽利用率
+    // 用步长循环让所有 BLOCK_SIZE 个线程合作加载，提高内存带宽利用率
     for (int idx = tid; idx < BLOCK_SIZE * HEAD_DIM; idx += blockDim.x) {
         int row = idx / HEAD_DIM;
         int col = idx % HEAD_DIM;
@@ -192,7 +190,7 @@ __global__ void flash_attn_kernel(
 #pragma unroll
                 for (int d = 0; d < HEAD_DIM; d++) {
                     float v = Vj[row * HEAD_DIM + d];
-                    o_reg[d] = (o_reg[d] * l * exp_old + v * exp_new) / l_new;
+                    o_reg[d] = o_reg[d] * exp_old + v * exp_new;
                 }
 
                 // 4) 更新状态
@@ -207,7 +205,7 @@ __global__ void flash_attn_kernel(
     if (active) {
 #pragma unroll
         for (int d = 0; d < HEAD_DIM; d++) {
-            O[q_row * HEAD_DIM + d] = o_reg[d];
+            O[q_row * HEAD_DIM + d] = o_reg[d] / l;
         }
     }
 }
@@ -349,16 +347,16 @@ bool verify(const float* ref, const float* out, int total, float eps = 1e-4f) {
 
 int main() {
     const int total = SEQ_LEN * HEAD_DIM;
+    const int RUNS  = 100;
     float scale = 1.0f / sqrtf((float)HEAD_DIM);
 
     // Host 内存
-    float* h_Q = new float[total];
-    float* h_K = new float[total];
-    float* h_V = new float[total];
+    float* h_Q   = new float[total];
+    float* h_K   = new float[total];
+    float* h_V   = new float[total];
     float* h_ref = new float[total];
     float* h_out = new float[total];
 
-    // 随机初始化
     srand(42);
     for (int i = 0; i < total; i++) {
         h_Q[i] = (float)rand() / RAND_MAX - 0.5f;
@@ -366,8 +364,14 @@ int main() {
         h_V[i] = (float)rand() / RAND_MAX - 0.5f;
     }
 
-    // CPU 参考结果
-    attention_cpu(h_Q, h_K, h_V, h_ref, SEQ_LEN, HEAD_DIM);
+    // -------------------------------------------------------
+    // CPU 计时
+    // -------------------------------------------------------
+    attention_cpu(h_Q, h_K, h_V, h_ref, SEQ_LEN, HEAD_DIM); // warmup + 生成参考结果
+    clock_t t0 = clock();
+    for (int r = 0; r < RUNS; r++)
+        attention_cpu(h_Q, h_K, h_V, h_out, SEQ_LEN, HEAD_DIM);
+    double cpu_ms = (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0 / RUNS;
 
     // Device 内存
     float *d_Q, *d_K, *d_V, *d_O;
@@ -375,58 +379,82 @@ int main() {
     cudaMalloc(&d_K, total * sizeof(float));
     cudaMalloc(&d_V, total * sizeof(float));
     cudaMalloc(&d_O, total * sizeof(float));
-
     cudaMemcpy(d_Q, h_Q, total * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_K, h_K, total * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V, total * sizeof(float), cudaMemcpyHostToDevice);
 
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float ms = 0;
+
     // -------------------------------------------------------
-    // 普通 GPU Attention
+    // 普通 GPU Attention：正确性 + 计时
     // -------------------------------------------------------
     float* d_S;
     cudaMalloc(&d_S, SEQ_LEN * SEQ_LEN * sizeof(float));
-
     dim3 block2d(16, 16);
-    dim3 grid_qk((SEQ_LEN + 15) / 16, (SEQ_LEN + 15) / 16);  // Kernel 1
-    dim3 grid_sv((HEAD_DIM + 15) / 16, (SEQ_LEN + 15) / 16); // Kernel 3
+    dim3 grid_qk((SEQ_LEN + 15) / 16, (SEQ_LEN + 15) / 16);
+    dim3 grid_sv((HEAD_DIM + 15) / 16, (SEQ_LEN + 15) / 16);
 
-    // Kernel 1: S = Q @ K^T * scale
-    qk_dot_kernel<<<grid_qk, block2d>>>(d_Q, d_K, d_S, SEQ_LEN, HEAD_DIM, scale);
+    auto run_naive = [&]() {
+        qk_dot_kernel<<<grid_qk, block2d>>>(d_Q, d_K, d_S, SEQ_LEN, HEAD_DIM, scale);
+        softmax_kernel<<<SEQ_LEN, 1>>>(d_S, SEQ_LEN);
+        sv_dot_kernel<<<grid_sv, block2d>>>(d_S, d_V, d_O, SEQ_LEN, HEAD_DIM);
+    };
 
-    // Kernel 2: softmax over each row
-    softmax_kernel<<<SEQ_LEN, 1>>>(d_S, SEQ_LEN);
-
-    // Kernel 3: O = S @ V
-    sv_dot_kernel<<<grid_sv, block2d>>>(d_S, d_V, d_O, SEQ_LEN, HEAD_DIM);
-
-    cudaDeviceSynchronize();
+    run_naive(); cudaDeviceSynchronize(); // warmup
     cudaMemcpy(h_out, d_O, total * sizeof(float), cudaMemcpyDeviceToHost);
+    bool naive_ok = verify(h_ref, h_out, total);
 
-    if (verify(h_ref, h_out, total))
-        printf("普通 GPU Attention: PASS\n");
+    cudaEventRecord(start);
+    for (int r = 0; r < RUNS; r++) run_naive();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    double naive_ms = ms / RUNS;
 
     cudaFree(d_S);
 
     // -------------------------------------------------------
-    // Flash Attention
+    // Flash Attention：正确性 + 计时
     // -------------------------------------------------------
-    int grid_fa = (SEQ_LEN + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int    grid_fa  = (SEQ_LEN + BLOCK_SIZE - 1) / BLOCK_SIZE;
     size_t smem_size = 3 * BLOCK_SIZE * HEAD_DIM * sizeof(float);
 
-    flash_attn_kernel<<<grid_fa, BLOCK_SIZE, smem_size>>>(
-        d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale
-    );
+    auto run_flash = [&]() {
+        flash_attn_kernel<<<grid_fa, BLOCK_SIZE, smem_size>>>(
+            d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale);
+    };
 
-    cudaDeviceSynchronize();
+    run_flash(); cudaDeviceSynchronize(); // warmup
     float* h_out2 = new float[total];
     cudaMemcpy(h_out2, d_O, total * sizeof(float), cudaMemcpyDeviceToHost);
-
-    if (verify(h_ref, h_out2, total))
-        printf("Flash Attention:    PASS\n");
-
+    bool flash_ok = verify(h_ref, h_out2, total);
     delete[] h_out2;
 
+    cudaEventRecord(start);
+    for (int r = 0; r < RUNS; r++) run_flash();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    double flash_ms = ms / RUNS;
+
+    // -------------------------------------------------------
+    // 结果汇总
+    // -------------------------------------------------------
+    printf("\n========== Attention Benchmark (seq=%d, d=%d, runs=%d) ==========\n",
+           SEQ_LEN, HEAD_DIM, RUNS);
+    printf("%-20s  %s   %8s\n", "Method", "Correct", "Avg time");
+    printf("%-20s  %s   %7.4f ms\n", "CPU",          "----", cpu_ms);
+    printf("%-20s  %s   %7.4f ms\n", "Naive GPU",    naive_ok ? "PASS" : "FAIL", naive_ms);
+    printf("%-20s  %s   %7.4f ms\n", "Flash Attn",   flash_ok ? "PASS" : "FAIL", flash_ms);
+    printf("  Naive GPU vs CPU:  %.1fx\n", cpu_ms / naive_ms);
+    printf("  Flash  vs Naive:   %.1fx\n", naive_ms / flash_ms);
+    printf("=================================================================\n");
+
     // Cleanup
+    cudaEventDestroy(start); cudaEventDestroy(stop);
     delete[] h_Q; delete[] h_K; delete[] h_V; delete[] h_ref; delete[] h_out;
     cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
     return 0;
