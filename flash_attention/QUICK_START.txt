@@ -1,0 +1,58 @@
+📋 NCU Profiling 快速执行
+
+=======================================================================
+🚀 【最简单】方法：直接复制粘贴命令到管理员 PowerShell 中运行
+=======================================================================
+
+【第 1 步】以管理员身份打开 PowerShell
+  - 按 Win+X → 选择 "Windows PowerShell (管理员)"
+  或
+  - 在开始菜单搜索 "PowerShell" → 右键 "以管理员身份运行"
+
+【第 2 步】复制粘贴以下命令（全部一起）
+
+---[开始复制]---
+
+$ncu = "C:\Program Files\NVIDIA Corporation\Nsight Compute 2026.2.1\target\windows-desktop-win7-x64\ncu.exe"
+$exe = "F:\AI.worktrees\todo-file-review\flash_attention\flash_attn.exe"
+$out = "F:\AI.worktrees\todo-file-review\flash_attention\ncu_report\flash_attn_report"
+& $ncu --set full -o $out $exe
+
+---[结束复制]---
+
+【第 3 步】按 Enter 执行
+
+等待 2-3 分钟，会看到类似输出：
+  ==PROF== Connected to process XXXXX
+  ==PROF== Collecting data...
+  ... (数据收集中) ...
+  ==PROF== Disconnected from process XXXXX
+
+✅ 完成！报告保存在：
+  F:\AI.worktrees\todo-file-review\flash_attention\ncu_report\flash_attn_report.ncu-rep
+
+=======================================================================
+📊 查看报告
+=======================================================================
+
+【GUI 查看】（推荐）
+
+$ncu = "C:\Program Files\NVIDIA Corporation\Nsight Compute 2026.2.1\target\windows-desktop-win7-x64\ncu.exe"
+& $ncu --ui "F:\AI.worktrees\todo-file-review\flash_attention\ncu_report\flash_attn_report.ncu-rep"
+
+这会打开 Nsight Compute 的图形界面显示详细分析
+
+=======================================================================
+📋 或者，你可以双击运行脚本（不用输入命令）
+=======================================================================
+
+Windows 资源管理器打开：
+  F:\AI.worktrees\todo-file-review\flash_attention\
+
+然后右键点击其中一个文件：
+  ✓ run_ncu_profiling.bat   （推荐）
+  ✓ run_ncu_profiling.ps1
+
+选择 "以管理员身份运行"，等待完成！
+
+=======================================================================
