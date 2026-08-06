@@ -174,17 +174,75 @@ Flash Attention 虽然减少了 32x 的全局内存流量，但实现的加速�
 | RTX 4090 | 1440 GB/s | 3-4x |
 | A100 | 2039 GB/s | 4-5x |
 
-### 如何生成完整的 NCU 报告
+### NCU 实测性能指标
 
-请参考 `ncu_report/NSIGHT_COMPUTE_INSTALL_GUIDE.md` 中的详细步骤。
+已完成 Nsight Compute 分析。以下是 RTX 3060 上的实测数据：
 
-**快速命令：**
+#### Memory Workload Analysis（qk_dot_kernel）
+
+| 指标 | 数值 |
+|------|------|
+| **L2 Cache Hit Rate** | **95.15%** |
+| Memory Throughput | 7.19 GB/s |
+| L1/TEX Hit Rate | 98.15% |
+| Memory Busy | 99.73% |
+| DRAM Active Cycles | 1,773,730.67 |
+
+#### GPU Speed Of Light（Roofline 分析）
+
+| 指标 | 数值 | 含义 |
+|------|------|------|
+| **Compute Throughput** | **22.55%** | 计算资源未充分利用 |
+| **Memory Throughput** | **99.73%** | ⚠ 内存严重饱和（Memory Bound）|
+| Max Bandwidth | 22.55% | 相对理论峰值计算性能 |
+
+**Roofline 结论：** Flash Attention 仍受**内存带宽限制**，不是计算限制。这符合设计目标——减少全局内存访问（已做到 32x 理论节省），但 RTX 3060 的 360 GB/s 内存带宽仍是瓶颈。
+
+#### SM 占用率（Occupancy Analysis）
+
+| 指标 | 数值 |
+|------|------|
+| **Achieved Occupancy** | **90.82%** |
+| Theoretical Occupancy | 100% |
+| Achieved Active Warps Per SM | 43.59 warps |
+
+**占用率分析：** 90.82% 的占用率接近理论值，说明 SM 资源配置良好，但内存 I/O 成为真正的瓶颈。
+
+#### 性能诊断总结
+
+1. **High L2 Cache Hit Rate（95.15%）** ✓ 
+   - Shared memory 和片上缓存优化有效
+   - 表示多数数据重用能被 L2 缓存命中
+
+2. **Memory Bound（99.73% Memory Busy）** ⚠
+   - 全局内存带宽饱和
+   - 即使减少了 32x 的全局流量，仍受限于 360 GB/s 峰值
+   - 新 GPU（A100/H100：>1.5 TB/s）能更好发挥 Flash Attention 优势
+
+3. **低计算占用率（22.55%）** ✓
+   - 符合预期——Flash Attention 本质就是**算术密度优化**，不是 FLOPs 优化
+   - 通过 online softmax 减少寄存器压力、降低内存流量
+
+### 如何查看完整的 NCU 报告
+
+报告文件：`ncu_report/flash_attn_report.ncu-rep`（8.1GB，包含详细性能计数器）
+
+**快速查看：**
 ```cmd
 cd F:\AI.worktrees\todo-file-review\flash_attention
-ncu --set full -o ncu_report\flash_attn_report flash_attn.exe
+ncu --import ncu_report\flash_attn_report.ncu-rep --page details
+```
+
+**GUI 查看（推荐）：**
+```cmd
 ncu-ui ncu_report\flash_attn_report.ncu-rep
 ```
 
+相关截图已保存到 `ncu_report/`：
+- `L2_Cache_Hit_Rate.png` - 内存层级分析
+- `Roofline_Analysis.png` - 性能特征与瓶颈
+- `Achieved_Occupancy.png` - SM 占用率分析
+
 ---
 
-**性能分析状态：** ✓ Benchmark 完成 | ⏳ NCU 工具待安装
+**性能分析状态：** ✓ Benchmark 完成 | ✓ NCU Profiling 完成 | ✓ 性能诊断完成
