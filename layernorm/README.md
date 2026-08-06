@@ -12,13 +12,11 @@ layernorm.exe
 
 ## Benchmark 结果
 
-**环境：** RTX 3060 12GB / CUDA 12.1 / M=1024 行 × N=1024 列 / 100 runs avg
+**环境：** RTX 3060 12GB / CUDA 13.2 / M=1024 行 × N=1024 列 / 100 runs avg
 
 | 版本 | 耗时 |
 |------|------|
-| GPU LayerNorm | — ms |
-
-> 待补：在 Windows 机上运行后填入实测数字。
+| GPU LayerNorm | 0.038 ms |
 
 ---
 

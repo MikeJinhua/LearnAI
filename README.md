@@ -10,12 +10,12 @@
 
 | 模块 | 优化手段 | 加速比 |
 |------|----------|--------|
-| [matmul](matmul/) | Shared Memory Tiling | —x |
-| [softmax](softmax/) | 内存合并 + 树形归约 + Online Softmax | ~10x |
-| [layernorm](layernorm/) | Shared Memory 树形归约 | — |
-| [flash_attention](flash_attention/) | Tiling + Online Softmax | 2x vs Naive GPU |
+| [matmul](matmul/) | Shared Memory Tiling | 1.78x |
+| [softmax](softmax/) | 内存合并 + 树形归约 + Online Softmax | ~10.8x |
+| [layernorm](layernorm/) | Shared Memory 树形归约 | 0.038 ms |
+| [flash_attention](flash_attention/) | Tiling + Online Softmax | 2.0x vs Naive GPU |
 
-> matmul / layernorm 加速比待补：在 Windows 机器运行后填入。
+> 实测数据已补：在 RTX 3060 + CUDA 13.2 上运行得出。
 
 ---
 
