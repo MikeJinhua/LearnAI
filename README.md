@@ -1,136 +1,220 @@
-# CUDA Kernel 从零实现
+# CUDA Kernel from Scratch
 
-从零手写 LLM 推理里最核心的几个 CUDA kernel，每个模块都对比 Naive 和优化版本，量化分析加速来源。
+This project implements several core CUDA kernels used in LLM inference from scratch and analyzes the bottlenecks and speedups of naive versus optimized versions.
 
-**环境：** RTX 3060 12GB / CUDA 12.1 / Windows 11
+**Environment:** RTX 3060 12GB / CUDA 13.2 / Windows 11
 
----
-
-## 模块一览
-
-| 模块 | 优化手段 | 加速比 |
-|------|----------|--------|
-| [matmul](matmul/) | Shared Memory Tiling | 1.78x |
-| [softmax](softmax/) | 内存合并 + 树形归约 + Online Softmax | ~10.8x |
-| [layernorm](layernorm/) | Shared Memory 树形归约 | 0.038 ms |
-| [flash_attention](flash_attention/) | Tiling + Online Softmax | 2.0x vs Naive GPU |
-
-> 实测数据已补：在 RTX 3060 + CUDA 13.2 上运行得出。
+**Note:** Unless otherwise specified, all benchmark numbers below are for FP32 kernels measured with `cudaEvent`; most timings are averaged over 100 runs. If a comparison baseline was not preserved in the repo, it is explicitly marked as "not measured / not retained" instead of being guessed.
 
 ---
 
-## 学习路线：优化思路是递进的
+## Module Overview
 
-四个模块不是孤立的，每一个都在前一个的基础上叠加新技巧：
+| Module | Optimization | Measured result |
+|--------|-------------|-----------------|
+| [matmul](matmul/) | Shared Memory Tiling | 3.70 ms → 2.08 ms, 1.78x (N=1024, FP32, single-run code baseline) |
+| [softmax](softmax/) | Memory coalescing + tree reduction + Online Softmax | Naive 0.415 ms, V2 0.036 ms, V3 0.037 ms (FP32, 100 runs avg) |
+| [layernorm](layernorm/) | Shared Memory tree reduction | GPU LayerNorm 0.038 ms (FP32, 100 runs avg; original CPU baseline not retained) |
+| [flash_attention](flash_attention/) | Tiling + Online Softmax | CPU 873.34 ms / Naive 21.10 ms / Flash 10.70 ms, Flash vs Naive = 2.0x (FP32, seq=4096, head_dim=64, 100 runs avg) |
+
+> This README uses the most defensible source data: the numbers backed by code and benchmark logs in the repo, without mixing different test conditions into one claim.
+
+---
+
+## Learning Path: The Optimizations Build on Each Other
+
+The four modules are not independent; each one adds a new idea on top of the previous one:
 
 ```
 matmul
-  └─ 核心问题：全局内存重复读取
-     解法：Shared Memory Tiling，每块数据只从全局内存读一次
+  └─ Core problem: repeated global memory reads
+     Solution: Shared Memory Tiling, so each tile is loaded from global memory once
 
 softmax
-  └─ 核心问题：单线程串行，内存访问不合并
-     解法：多线程并行 + Coalesced Access + 树形归约
-     进阶：Online Softmax，max 和 sum 一遍合并
+  └─ Core problem: single-thread serial reduction and poor memory coalescing
+     Solution: parallel threads + coalesced access + tree reduction
+     Advanced step: Online Softmax, merging max and sum in one pass
 
 layernorm
-  └─ 与 Softmax 结构相同
-     核心：两轮树形归约（先算 mean，再算 var）
+  └─ Similar to softmax
+     Core idea: two tree reductions (mean then variance)
 
 flash_attention
-  └─ 把 matmul tiling + online softmax 合并到一个 kernel
-     核心问题：标准 Attention 需要写出 O(N²) 的 attention 矩阵
-     解法：tile 流式处理，中间结果留在 shared memory，永不写回全局内存
+  └─ Combines matmul tiling and online softmax into one kernel
+     Core problem: standard attention requires storing the O(N²) score matrix
+     Solution: tile-by-tile streaming with intermediate values kept in shared memory
 ```
 
 ---
 
-## 模块 1：Matrix Multiplication
+## Module 1: Matrix Multiplication
 
-**问题**：计算 C = A × B（N=1024），每个输出元素需要读 A 的一行和 B 的一列。
-Naive 版本每行被重复读取 N 次，全局内存访问量 = 2N³ ≈ 2GB。
+**Problem:** computing C = A × B for N=1024 means each output element reads one row from A and one column from B. The naive version repeatedly re-reads the same row/column data, causing global memory traffic of roughly 2N³ ≈ 2GB.
 
-**优化**：Shared Memory Tiling。把 A/B 分成 16×16 的小块，由 block 内 256 个 thread 协作加载，每块只从全局内存读一次，被复用 16 次，全局内存读写量降至 2N²。
+**Optimization:** Shared Memory Tiling. Split A and B into 16×16 tiles, have 256 threads inside a block collaboratively load the tile into shared memory, and reuse that data across the block before moving to the next tile.
 
 ```
-全局内存读取量：
+Global memory traffic:
   Naive:         2 × 1024³ ≈ 2147 MB
-  Shared Memory: 2 × 1024² ≈    2 MB  （节省 ~1000x，实测 ~Xx）
+  Shared Memory: 2 × 1024² ≈    2 MB
 ```
 
-→ [详细说明](matmul/README.md)
+The measured benchmark from the main implementation in the repo is:
+
+```
+Naive = 3.70 ms
+Shared = 2.08 ms
+Speedup = 1.78x
+```
+
+A quick estimate:
+
+```
+2 × 1024³ / 2.08 ms ≈ 1.04 TFLOPS
+RTX 3060 FP32 peak ≈ 12.7 TFLOPS
+1.04 / 12.7 ≈ 8%
+```
+
+This shows the bottleneck is not simply “the kernel is compute-bound.” It is dominated by shared-memory traffic, tile granularity, and bank conflicts. This is the same bottleneck family seen later in Flash Attention: throughput is limited by the on-chip memory pipeline rather than the raw FP32 peak.
+
+**Next-step optimizations:** register blocking (each thread computes a larger chunk and keeps accumulators in registers), float4 vectorized loads, bank-conflict elimination, and then tensor-core / `ldmatrix`-style paths once the memory path is improved.
+
+→ [Detailed notes](matmul/README.md)
 
 ---
 
-## 模块 2：Softmax
+## Module 2: Softmax
 
-**问题**：Naive 每 block 只有 1 个 thread，GPU 内存带宽利用率仅 3%（32 个 float 的事务只用 1 个）。
+**Problem:** in the naive version, each block has only one thread, so memory requests are poorly coalesced and bandwidth utilization is very low.
 
-**优化 V2**：256 个 thread 并行，warp 内连续访问内存（利用率 ≈ 100%），shared memory 树形归约找 max/sum（8 步 vs 1024 步串行）。
+**V2 optimization:** use 256 threads per block, coalesced memory access, and tree reduction in shared memory to find max and sum more efficiently.
 
-**优化 V3**：Online Softmax，一遍扫描同时维护 max 和 sum，省掉一轮全局内存读取。
+**V3 optimization:** Online Softmax keeps the running max and sum in one pass and avoids an extra full pass over the input.
 
 ```
-内存带宽利用率：
-  Naive → V2:  3% → 100%，实测 ~10x 加速
+Measured result:
+  Naive: 0.415 ms
+  V2:    0.036 ms
+  V3:    0.037 ms
+  Speedup: about 11.5x (V2 vs Naive)
 
-Online Softmax 核心公式：
+Online Softmax update:
   m_new = max(m, score)
   l_new = l × exp(m - m_new) + exp(score - m_new)
-  扫描一遍即得正确的归一化分母，无需存历史 score
+  This lets the normalized denominator be computed in a single streaming pass without storing the full historical score matrix.
 ```
 
-→ [详细说明](softmax/README.md)
+One important nuance: in this standalone softmax benchmark, V3 is slightly slower than V2 because the savings from removing one global read are partially offset by per-element rescaling and branch overhead. In other words, the real value of online softmax is not that it is always a standalone winner in a tiny kernel; its true strength shows up in Flash Attention, where tile-by-tile streaming is required.
+
+→ [Detailed notes](softmax/README.md)
 
 ---
 
-## 模块 3：Layer Normalization
+## Module 3: Layer Normalization
 
-**公式**：`y = (x - μ) / sqrt(σ² + ε) × γ + β`
+**Formula:** `y = (x - μ) / sqrt(σ² + ε) × γ + β`
 
-结构与 Softmax 完全相同，区别在数学：Softmax 归约 max/sum，LayerNorm 归约 mean/var。
-同样用 shared memory 树形归约，两轮扫描（先算均值，再算方差），256 线程并行写回。
+The structure is similar to softmax. The difference is that softmax reduces max/sum, while LayerNorm reduces mean/variance. The implementation uses shared-memory tree reduction: two passes, first for mean and then for variance, followed by a final writeback.
 
-→ [详细说明](layernorm/README.md)
+**Measured:** GPU LayerNorm is around 0.038 ms (FP32, 100 runs avg). This is the optimized latency, not a speedup claim.
 
----
+**Missing baseline:** the repo does not retain a stable CPU or naive-GPU baseline for LayerNorm, so this section intentionally avoids overstating a speedup ratio.
 
-## 模块 4：Flash Attention
-
-**问题**：标准 Attention 需要把 seq×seq 的 S 矩阵写到全局内存，seq=4096 时 64MB，被三个 kernel 反复搬运共 ≈ 256MB。
-
-**优化**：把 QK^T、softmax、SV 三步合并进一个 kernel。Q/K/V 分 tile 流式处理，attention score 只在 shared memory 里存活，永不写回全局内存。用 Online Softmax 的 (m, l, o_acc) 状态在 tile 间累积，最后一次性写回 O。
-
-```
-全局内存读写量对比（seq=4096, head_dim=64）：
-  Naive GPU：QK^T 写 64MB + softmax 读写 128MB + SV 读 64MB ≈ 256MB
-  Flash Attn：Q/K/V 各读一次 + O 写一次                      ≈   8MB
-  理论节省：32x，实测 2x（其他瓶颈限制）
-
-seq 越长，S 矩阵是 O(N²)，Q/K/V/O 是 O(N·d)，收益越大：
-  seq=1024 → 节省约 9x
-  seq=4096 → 节省约 32x
-  seq=8192 → 节省约 35x
-```
-
-→ [详细说明](flash_attention/README.md)
+→ [Detailed notes](layernorm/README.md)
 
 ---
 
-## NCU Profiling（待补）
+## Module 4: Flash Attention
+
+**Problem:** standard attention writes the full seq×seq score matrix to global memory. For seq=4096, the score matrix alone is about 64MB per head, and the naive 3-kernel flow pushes roughly 256MB of global traffic.
+
+**Optimization:** fuse QK^T, softmax, and SV into one kernel. Q/K/V are streamed in tiles, and the attention score is kept in shared memory instead of being written back to global memory. Online softmax tracks `(m, l, o_acc)` across tiles, then writes the final output once.
+
+```
+Measured results (seq=4096, head_dim=64, FP32, 100 runs avg):
+  CPU:        873.34 ms
+  Naive GPU:  21.10 ms
+  Flash Attn: 10.70 ms
+  Flash vs Naive: 2.0x
+```
+
+Theoretically, Flash Attention can reduce global memory traffic from 256MB to about 8MB, which is a 32x reduction. In practice, on RTX 3060 the observed gain is only about 2x, which means the bottleneck has moved from DRAM traffic to the on-chip memory pipeline: shared memory, LSU behavior, tile organization, and register reuse become the limiting factors.
+
+This is not a failure of the optimization idea; it is a shift in the actual bottleneck.
+
+→ [Detailed notes](flash_attention/README.md)
+
+---
+
+## NCU Profiling (real report retained)
+
+The Nsight Compute report was generated on Windows + RTX 3060 + CUDA 13.2, and the key screenshots/report files were retained in the repo. The important point is that we only keep facts that are supported by the profiling data and do not invent missing values.
 
 ```cmd
-# 编译加 -lineinfo 支持 source correlation
+# compile with line-info support
 nvcc -O2 -arch=sm_86 -lineinfo flash_attn.cu -o flash_attn.exe
 
-# Profiling
+# profile flash-attention and naive kernels together
 ncu --set full ^
     --kernel-name flash_attn_kernel ^
     --kernel-name qk_dot_kernel ^
+    --kernel-name softmax_kernel ^
+    --kernel-name sv_dot_kernel ^
     -o flash_attn_report ^
     flash_attn.exe
 
 ncu-ui flash_attn_report.ncu-rep
 ```
 
-重点关注：Memory Throughput、L2 Hit Rate、Roofline（Memory Bound vs Compute Bound）。
+### Key NCU metrics (Flash Attention kernel)
+
+| Metric | Value |
+|--------|-------|
+| L2 Cache Hit Rate | 95.15% |
+| Achieved Occupancy | 90.82% |
+| Memory Busy | 99.73% |
+| Compute Throughput | 22.55% |
+
+The interpretation is straightforward:
+
+- **Memory Busy = 99.73%** and **Compute Throughput = 22.55%** together indicate a textbook **memory-bound** situation.
+- **L2 Hit Rate = 95.15%** tells us this is not really a DRAM miss problem; the data is being serviced by the on-chip hierarchy rather than the external memory path.
+
+So the central conclusion is not “pure DRAM memory-bound” or “pure compute-bound.” The real conclusion is:
+
+> Flash Attention removes the DRAM-level score-matrix traffic, but it does not eliminate the memory bottleneck; it moves it up one layer, into the on-chip memory pipeline.
+
+This explains the gap between the theoretical 32x reduce-in-traffic estimate and the observed 2.0x runtime gain. The theoretical estimate counted only global-memory traffic, while the actual kernel still pays a large cost in shared-memory loads/stores and register reuse inside the tile loop.
+
+**Why this conclusion is reliable:**
+
+- 99.73% Memory Busy proves the kernel is still dominated by memory activity.
+- 95.15% L2 hit rate shows the memory pressure is not mainly hitting DRAM.
+- 90.82% occupancy shows occupancy is not the main limiter.
+- 22.55% compute throughput shows the ALU is not saturated; the bottleneck is still upstream of the arithmetic pipeline.
+
+### Important limitations
+
+- **Naive-kernel NCU comparison:** the retained report contains the flash-kernel metrics, but not a clean naive-vs-flash side-by-side NCU table. We do not invent that missing comparison.
+- **cuBLAS / PyTorch SDPA baseline:** not measured in this repo, so it is documented as “not measured / not included.”
+- **LayerNorm baseline:** the repo does not retain a stable CPU or naive-GPU baseline for LayerNorm, so the public summary avoids overstating a speedup claim.
+
+### Overall takeaway
+
+1. Flash Attention clearly delivers a real gain: CPU 873.34 ms → Naive 21.10 ms → Flash 10.70 ms, or about 2.0x.  
+2. The important NCU insight is that the bottleneck shifts from DRAM traffic to on-chip memory access behavior.  
+3. We keep the real evidence in the repo and avoid making unsupported claims in the public summary.  
+4. Missing comparisons are listed as missing rather than guessed.
+
+---
+
+## Next Steps
+
+The next real optimization targets are not vague “more speed” ideas; they are specific ways to reduce on-chip memory pressure within each tile:
+
+- register blocking: keep more accumulation in registers instead of repeatedly writing to shared memory
+- float4 vectorization: reduce instruction count and improve memory coalescing
+- bank-conflict elimination: adjust the shared-memory layout and access pattern
+- higher-end paths: Tensor Core / `ldmatrix`-style movement when the goal is to reduce smem instruction count further
+
+This is the same root cause that shows up in both Flash Attention and MatMul: the problem is not raw arithmetic capability, but the path and organization of memory access inside the tile.
