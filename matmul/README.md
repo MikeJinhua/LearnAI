@@ -19,14 +19,12 @@ matmul.exe
 
 ## Benchmark 结果
 
-**环境：** RTX 3060 12GB / CUDA 12.1 / N=1024×1024
+**环境：** RTX 3060 12GB / CUDA 13.2 / N=1024×1024 / 1 run
 
 | 版本 | 耗时 | 对比 |
 |------|------|------|
-| Naive | — ms | baseline |
-| Shared Memory | — ms | —x |
-
-> 待补：在 Windows 机上运行后填入实测数字。
+| Naive | 3.70 ms | baseline |
+| Shared Memory | 2.08 ms | 1.78x |
 
 ---
 

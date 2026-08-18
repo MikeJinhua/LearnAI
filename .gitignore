@@ -23,3 +23,6 @@ build/
 **/build/
 .env
 .venv
+# NCU 报告（大型二进制文件）
+*.ncu-rep
+
