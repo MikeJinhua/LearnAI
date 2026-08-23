@@ -15,7 +15,7 @@ This project implements several core CUDA kernels used in LLM inference from scr
 | [matmul](matmul/) | Shared Memory Tiling | 3.70 ms → 2.08 ms, 1.78x (N=1024, FP32, single-run code baseline) |
 | [softmax](softmax/) | Memory coalescing + tree reduction + Online Softmax | Naive 0.415 ms, V2 0.036 ms, V3 0.037 ms (FP32, 100 runs avg) |
 | [layernorm](layernorm/) | Shared Memory tree reduction | GPU LayerNorm 0.038 ms (FP32, 100 runs avg; original CPU baseline not retained) |
-| [flash_attention](flash_attention/) | Tiling + Online Softmax | CPU 873.34 ms / Naive 21.10 ms / Flash 10.70 ms, Flash vs Naive = 2.0x (FP32, seq=4096, head_dim=64, 100 runs avg) |
+| [flash_attention](flash_attention/) | Warp collaboration + Online Softmax | V1 10.4941 ms → V2 5.7011 ms, **1.84x speedup / 45.7% lower latency** (FP32, seq=4096, head_dim=64, 100 runs avg) |
 
 > This README uses the most defensible source data: the numbers backed by code and benchmark logs in the repo, without mixing different test conditions into one claim.
 
@@ -132,13 +132,14 @@ The structure is similar to softmax. The difference is that softmax reduces max/
 
 ```
 Measured results (seq=4096, head_dim=64, FP32, 100 runs avg):
-  CPU:        873.34 ms
-  Naive GPU:  21.10 ms
-  Flash Attn: 10.70 ms
-  Flash vs Naive: 2.0x
+  Naive GPU:     20.4545 ms
+  Flash Attn V1: 10.4941 ms
+  Flash Attn V2:  5.7011 ms
+  V2 vs V1:       1.84x (45.7% lower latency)
+  V2 vs Naive:    3.59x
 ```
 
-Theoretically, Flash Attention can reduce global memory traffic from 256MB to about 8MB, which is a 32x reduction. In practice, on RTX 3060 the observed gain is only about 2x, which means the bottleneck has moved from DRAM traffic to the on-chip memory pipeline: shared memory, LSU behavior, tile organization, and register reuse become the limiting factors.
+V1 assigns one complete query row to one thread. V2 instead uses one warp to collaborate on a row, launches eight warps per block, and keeps only two output dimensions per lane. Registers fall from 96 to 40 per thread and dynamic shared memory from 24KB to 16KB per block. This raises achieved occupancy from 7.27% to 60.62% and removes much of V1's latency-hiding problem.
 
 This is not a failure of the optimization idea; it is a shift in the actual bottleneck.
 
@@ -154,44 +155,32 @@ The Nsight Compute report was generated on Windows + RTX 3060 + CUDA 13.2, and t
 # compile with line-info support
 nvcc -O2 -arch=sm_86 -lineinfo flash_attn.cu -o flash_attn.exe
 
-# profile flash-attention and naive kernels together
-ncu --set full ^
-    --kernel-name flash_attn_kernel ^
-    --kernel-name qk_dot_kernel ^
-    --kernel-name softmax_kernel ^
-    --kernel-name sv_dot_kernel ^
-    -o flash_attn_report ^
-    flash_attn.exe
+# collect V1 and V2 separately; skip the warmup launch
+ncu --set full --kernel-name regex:flash_attn_kernel --launch-skip 1 --launch-count 1 ^
+    -o ncu_report\flash_v1 flash_attn.exe --profile-v1
+ncu --set full --kernel-name regex:flash_attn_v2_kernel --launch-skip 1 --launch-count 1 ^
+    -o ncu_report\flash_v2 flash_attn.exe --profile-v2
 
 ncu-ui flash_attn_report.ncu-rep
 ```
 
-### Key NCU metrics (Flash Attention kernel)
+### Key NCU metrics (V1 versus V2)
 
-| Metric | Value |
-|--------|-------|
-| L2 Cache Hit Rate | 95.15% |
-| Achieved Occupancy | 90.82% |
-| Memory Busy | 99.73% |
-| Compute Throughput | 22.55% |
+| Metric | V1 | V2 |
+|--------|---:|---:|
+| NCU duration | 11.05 ms | 6.90 ms |
+| Compute throughput | 10.56% | 74.41% |
+| DRAM throughput | 0.43% | 3.63% |
+| Theoretical occupancy | 8.33% | 83.33% |
+| Achieved occupancy | 7.27% | 60.62% |
+| Eligible warps / scheduler | 0.12 | 2.35 |
+| No eligible | 88.22% | 30.19% |
+| Registers / thread | 96 | 40 |
+| Dynamic shared memory / block | 24.58KB | 16.38KB |
 
-The interpretation is straightforward:
+V1 is latency-bound because it exposes only one warp per block and has high register/shared-memory usage. With almost no other eligible warp available, the scheduler cannot hide dependency and shared-memory latency. V2 directly addresses that evidence: eight warps collaborate within each block, warp shuffles parallelize the dot product, and lower per-thread state allows far higher occupancy.
 
-- **Memory Busy = 99.73%** and **Compute Throughput = 22.55%** together indicate a textbook **memory-bound** situation.
-- **L2 Hit Rate = 95.15%** tells us this is not really a DRAM miss problem; the data is being serviced by the on-chip hierarchy rather than the external memory path.
-
-So the central conclusion is not “pure DRAM memory-bound” or “pure compute-bound.” The real conclusion is:
-
-> Flash Attention removes the DRAM-level score-matrix traffic, but it does not eliminate the memory bottleneck; it moves it up one layer, into the on-chip memory pipeline.
-
-This explains the gap between the theoretical 32x reduce-in-traffic estimate and the observed 2.0x runtime gain. The theoretical estimate counted only global-memory traffic, while the actual kernel still pays a large cost in shared-memory loads/stores and register reuse inside the tile loop.
-
-**Why this conclusion is reliable:**
-
-- 99.73% Memory Busy proves the kernel is still dominated by memory activity.
-- 95.15% L2 hit rate shows the memory pressure is not mainly hitting DRAM.
-- 90.82% occupancy shows occupancy is not the main limiter.
-- 22.55% compute throughput shows the ALU is not saturated; the bottleneck is still upstream of the arithmetic pipeline.
+The old `99.73% Memory Throughput / 90.82% Occupancy` values belong to the naive `qk_dot_kernel`; they must not be attributed to either Flash kernel.
 
 ### Important limitations
 
@@ -201,9 +190,9 @@ This explains the gap between the theoretical 32x reduce-in-traffic estimate and
 
 ### Overall takeaway
 
-1. Flash Attention clearly delivers a real gain: CPU 873.34 ms → Naive 21.10 ms → Flash 10.70 ms, or about 2.0x.  
-2. The important NCU insight is that the bottleneck shifts from DRAM traffic to on-chip memory access behavior.  
-3. We keep the real evidence in the repo and avoid making unsupported claims in the public summary.  
+1. Flash Attention V2 reduces latency from 10.4941 ms to 5.7011 ms: 1.84x faster, or 45.7% lower latency.
+2. The important NCU insight is that V1 is latency-bound due to insufficient eligible warps; V2 raises parallelism and occupancy.
+3. We keep the real evidence in the repo and avoid making unsupported claims in the public summary.
 4. Missing comparisons are listed as missing rather than guessed.
 
 ---

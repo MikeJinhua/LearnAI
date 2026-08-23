@@ -1,5 +1,37 @@
 # 🚀 运行 NCU Profiling 的步骤
 
+## V1 / V2 单独采集（推荐）
+
+程序提供了只启动目标 kernel 的 profiling 模式。每种模式会启动两次同名 kernel：
+第一次 warmup，第二次供 NCU 采集。这样报告里不会再混入 100 次 benchmark 和 naive kernels。
+
+```powershell
+cd F:\AI\flash_attention
+
+# UTF-8 源码在中文 Windows 上需要显式传给 MSVC
+nvcc -O2 -arch=sm_86 -lineinfo -Xcompiler /utf-8 flash_attn.cu -o flash_attn_v2.exe
+
+$ncu = "C:\Program Files\NVIDIA Corporation\Nsight Compute 2026.2.1\target\windows-desktop-win7-x64\ncu.exe"
+
+# V1：跳过 warmup，只采第二次 launch
+& $ncu --set full --kernel-name regex:flash_attn_kernel --launch-skip 1 --launch-count 1 `
+    -o ncu_report\flash_v1 .\flash_attn_v2.exe --profile-v1
+
+# V2
+& $ncu --set full --kernel-name regex:flash_attn_v2_kernel --launch-skip 1 --launch-count 1 `
+    -o ncu_report\flash_v2 .\flash_attn_v2.exe --profile-v2
+```
+
+打开并对比：
+
+```powershell
+ncu-ui ncu_report\flash_v1.ncu-rep
+ncu-ui ncu_report\flash_v2.ncu-rep
+```
+
+重点比较 Occupancy、Scheduler Statistics、Warp State Statistics，以及 Source 页的
+`Warp Stall Sampling (Not-Issued Samples)`。`Memory Throughput` 是综合指标，不等于 DRAM throughput。
+
 已为你准备好可以直接运行的脚本。选择以下任意一种方法执行：
 
 ## 方法 1：批处理文件（最简单）✨

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <float.h>
+#include <string.h>
 
 // -------------------------------------------------------
 // Flash Attention v1 骨架
@@ -18,9 +19,8 @@
 // -------------------------------------------------------
 
 // 超参数
-const int SEQ_LEN = 4096;    // 序列长度（先用小值调通）
-const int HEAD_DIM = 64;   // 每个 head 的维度
-const int BLOCK_SIZE = 32; // tile 大小
+constexpr int SEQ_LEN = 4096;    // 序列长度（先用小值调通）
+constexpr int HEAD_DIM = 64;   // 每个 head 的维度
 
 // -------------------------------------------------------
 // Kernel: Flash Attention（单个 head）
@@ -30,9 +30,9 @@ const int BLOCK_SIZE = 32; // tile 大小
 // 输出：
 //   O        shape: [SEQ_LEN, HEAD_DIM]
 //
-// Grid:  (ceil_div(seq_len, BLOCK_SIZE),)  — 每个 block 负责 Q 的一个 tile
-// Block: (BLOCK_SIZE,)                     — 这版实现要求 blockDim.x == BLOCK_SIZE
-// Smem:  3 * BLOCK_SIZE * HEAD_DIM * sizeof(float)
+// Grid:  (ceil_div(seq_len, 32),)  — 每个 block 负责 Q 的一个 tile
+// Block: (32,)                     — 这版实现要求 blockDim.x == 32
+// Smem:  3 * 32 * HEAD_DIM * sizeof(float)
 //
 // 注意：
 // 1) 这版 demo 把 HEAD_DIM 固定成编译期常量，要求传入的 head_dim == HEAD_DIM。
@@ -118,10 +118,10 @@ __global__ void flash_attn_kernel(
 ) {
     // 这版 kernel 把每个线程绑定到一行 Q，并把 O 暂存在寄存器里，
     // 因此要求 launch 时使用固定的线程数和 head_dim。
-    if (blockDim.x != BLOCK_SIZE || head_dim != HEAD_DIM) return;
+    if (blockDim.x != 32 || head_dim != HEAD_DIM) return;
 
     // 每个 block 负责一个 Q 的 tile
-    int tile_row = blockIdx.x * BLOCK_SIZE;
+    int tile_row = blockIdx.x * 32;
     int tid = threadIdx.x;
     int q_row = tile_row + tid;
     bool active = (q_row < seq_len);
@@ -129,8 +129,8 @@ __global__ void flash_attn_kernel(
     // 申请 shared memory
     extern __shared__ float smem[];
     float* Qi = smem;                          // [block_size, head_dim]
-    float* Kj = Qi + BLOCK_SIZE * HEAD_DIM;    // [block_size, head_dim]
-    float* Vj = Kj + BLOCK_SIZE * HEAD_DIM;    // [block_size, head_dim]
+    float* Kj = Qi + 32 * HEAD_DIM;    // [block_size, head_dim]
+    float* Vj = Kj + 32 * HEAD_DIM;    // [block_size, head_dim]
 
     // 把当前 q_row 的输出累积在寄存器里，最后一次性写回全局内存。
     float o_reg[HEAD_DIM];
@@ -140,8 +140,8 @@ __global__ void flash_attn_kernel(
     }
 
     // 加载 Q tile 到 shared memory（SRAM 是 block 内所有线程共享的）
-    // 用步长循环让所有 BLOCK_SIZE 个线程合作加载，提高内存带宽利用率
-    for (int idx = tid; idx < BLOCK_SIZE * HEAD_DIM; idx += blockDim.x) {
+    // 用步长循环让所有 32 个线程合作加载，提高内存带宽利用率
+    for (int idx = tid; idx < 32 * HEAD_DIM; idx += blockDim.x) {
         int row = idx / HEAD_DIM;
         int col = idx % HEAD_DIM;
         int global_row = tile_row + row;
@@ -154,10 +154,10 @@ __global__ void flash_attn_kernel(
     float l = 0.0f;
 
     // 外层循环：遍历所有 K/V 块
-    for (int j = 0; j < seq_len; j += BLOCK_SIZE) {
+    for (int j = 0; j < seq_len; j += 32) {
 
         // 加载当前 K/V tile 到 shared memory（同样是所有线程协作加载，具体分配无所谓）
-        for (int idx = tid; idx < BLOCK_SIZE * HEAD_DIM; idx += blockDim.x) {
+        for (int idx = tid; idx < 32 * HEAD_DIM; idx += blockDim.x) {
             int row = idx / HEAD_DIM;
             int col = idx % HEAD_DIM;
             int global_row = j + row;
@@ -168,7 +168,7 @@ __global__ void flash_attn_kernel(
 
         // 当前线程负责 q_row 这一行
         if (active) {
-            for (int row = 0; row < BLOCK_SIZE; row++) {
+            for (int row = 0; row < 32; row++) {
                 int k_row = j + row;
                 if (k_row >= seq_len) continue;
 
@@ -211,14 +211,14 @@ __global__ void flash_attn_kernel(
 }
 
 // -------------------------------------------------------
-// Flash Attention v2 骨架（仅结构，不含完整实现）
+// Flash Attention v2：一个 warp 协作处理一行 Q
 //
 // 思路（和 v1 的区别）：
 // 1) 依然按 Q/K/V tile 流式处理
 // 2) 更强调在 block/warp 内做并行归约（max/sum）
 // 3) 尽量把中间量留在寄存器，减少对全局内存读写
 // -------------------------------------------------------
-__global__ void flash_attn_v2_kernel_skeleton(
+__global__ void flash_attn_v2_kernel(
     const float* Q,
     const float* K,
     const float* V,
@@ -227,39 +227,35 @@ __global__ void flash_attn_v2_kernel_skeleton(
     int head_dim,
     float scale
 ) {
-    int tile_row = blockIdx.x * BLOCK_SIZE;
     int tid = threadIdx.x;
-    int q_row = tile_row + tid;
-    bool active = (q_row < seq_len);
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int tile_row = blockIdx.x * 32;
 
     extern __shared__ float smem[];
-    float* Qi = smem;
-    float* Kj = Qi + BLOCK_SIZE * head_dim;
-    float* Vj = Kj + BLOCK_SIZE * head_dim;
+    float* Kj = smem;
+    float* Vj = Kj + 32 * head_dim;
 
-    // TODO(v2): 也可以把 O 的部分累积放到寄存器数组，最后一次性写回。
+    // 每个 warp 负责 4 行；每个 lane 保存每行的两个 Q/O 元素。
+    float q0[4];
+    float q1[4];
+    float o0[4] = {0.0f};
+    float o1[4] = {0.0f};
+    float m[4];
+    float l[4] = {0.0f};
 
-    // 1) 载入当前 Q tile
-    for (int idx = tid; idx < BLOCK_SIZE * head_dim; idx += blockDim.x) {
-        int row = idx / head_dim;
-        int col = idx % head_dim;
-        int global_row = tile_row + row;
-        Qi[idx] = (global_row < seq_len) ? Q[global_row * head_dim + col] : 0.0f;
-    }
-    __syncthreads();
-
-    // 2) 初始化在线 softmax 状态
-    float m = -FLT_MAX;
-    float l = 0.0f;
-    if (active) {
-        for (int d = 0; d < head_dim; d++) {
-            O[q_row * head_dim + d] = 0.0f;
-        }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int q_row = tile_row + warp + r * 8;
+        bool active = q_row < seq_len;
+        q0[r] = active ? Q[q_row * HEAD_DIM + lane] : 0.0f;
+        q1[r] = active ? Q[q_row * HEAD_DIM + lane + 32] : 0.0f;
+        m[r] = -FLT_MAX;
     }
 
-    // 3) 流式遍历所有 K/V tile
-    for (int j = 0; j < seq_len; j += BLOCK_SIZE) {
-        for (int idx = tid; idx < BLOCK_SIZE * head_dim; idx += blockDim.x) {
+    // 每个 block 仍处理 32 行 Q，K/V tile 的跨行复用粒度与 V1 相同。
+    for (int j = 0; j < seq_len; j += 32) {
+        for (int idx = tid; idx < 32 * head_dim; idx += blockDim.x) {
             int row = idx / head_dim;
             int col = idx % head_dim;
             int global_row = j + row;
@@ -268,17 +264,40 @@ __global__ void flash_attn_v2_kernel_skeleton(
         }
         __syncthreads();
 
-        // TODO(v2-step1): 每个线程/warp 计算局部 score 片段。
-        // TODO(v2-step2): 对 score 在 block/warp 内做并行 max 归约，得到 m_tile。
-        // TODO(v2-step3): 对 exp(score - m_tile) 做并行 sum 归约，得到 l_tile。
-        // TODO(v2-step4): 用 m/l 与 m_tile/l_tile 合并，并并行累积 O。
+        for (int k = 0; k < 32 && j + k < seq_len; ++k) {
+            float k0 = Kj[k * HEAD_DIM + lane];
+            float k1 = Kj[k * HEAD_DIM + lane + 32];
+            float v0 = Vj[k * HEAD_DIM + lane];
+            float v1 = Vj[k * HEAD_DIM + lane + 32];
 
-        // 占位：避免 scale 参数未使用
-        if (active && scale < 0.0f) {
-            O[q_row * head_dim] = O[q_row * head_dim];
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                float score = q0[r] * k0 + q1[r] * k1;
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    score += __shfl_down_sync(0xffffffff, score, offset);
+                }
+                score = __shfl_sync(0xffffffff, score, 0) * scale;
+
+                float m_new = fmaxf(m[r], score);
+                float exp_old = expf(m[r] - m_new);
+                float exp_new = expf(score - m_new);
+                l[r] = l[r] * exp_old + exp_new;
+                o0[r] = o0[r] * exp_old + v0 * exp_new;
+                o1[r] = o1[r] * exp_old + v1 * exp_new;
+                m[r] = m_new;
+            }
         }
-
         __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int q_row = tile_row + warp + r * 8;
+        if (q_row < seq_len) {
+            O[q_row * HEAD_DIM + lane] = o0[r] / l[r];
+            O[q_row * HEAD_DIM + lane + 32] = o1[r] / l[r];
+        }
     }
 }
 
@@ -345,7 +364,7 @@ bool verify(const float* ref, const float* out, int total, float eps = 1e-4f) {
 }
 
 
-int main() {
+int main(int argc, char** argv) {
     const int total = SEQ_LEN * HEAD_DIM;
     const int RUNS  = 100;
     float scale = 1.0f / sqrtf((float)HEAD_DIM);
@@ -364,14 +383,20 @@ int main() {
         h_V[i] = (float)rand() / RAND_MAX - 0.5f;
     }
 
+    bool profile_v1 = argc > 1 && strcmp(argv[1], "--profile-v1") == 0;
+    bool profile_v2 = argc > 1 && strcmp(argv[1], "--profile-v2") == 0;
+
     // -------------------------------------------------------
     // CPU 计时
     // -------------------------------------------------------
-    attention_cpu(h_Q, h_K, h_V, h_ref, SEQ_LEN, HEAD_DIM); // warmup + 生成参考结果
-    clock_t t0 = clock();
-    for (int r = 0; r < RUNS; r++)
-        attention_cpu(h_Q, h_K, h_V, h_out, SEQ_LEN, HEAD_DIM);
-    double cpu_ms = (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0 / RUNS;
+    double cpu_ms = 0.0;
+    if (!profile_v1 && !profile_v2) {
+        attention_cpu(h_Q, h_K, h_V, h_ref, SEQ_LEN, HEAD_DIM); // warmup + 生成参考结果
+        clock_t t0 = clock();
+        for (int r = 0; r < RUNS; r++)
+            attention_cpu(h_Q, h_K, h_V, h_out, SEQ_LEN, HEAD_DIM);
+        cpu_ms = (double)(clock() - t0) / CLOCKS_PER_SEC * 1000.0 / RUNS;
+    }
 
     // Device 内存
     float *d_Q, *d_K, *d_V, *d_O;
@@ -382,6 +407,28 @@ int main() {
     cudaMemcpy(d_Q, h_Q, total * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_K, h_K, total * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V, total * sizeof(float), cudaMemcpyHostToDevice);
+
+    int grid_fa = (SEQ_LEN + 32 - 1) / 32;
+    size_t smem_v1 = 3 * 32 * HEAD_DIM * sizeof(float);
+    size_t smem_v2 = 2 * 32 * HEAD_DIM * sizeof(float);
+
+    // NCU 专用模式：一次 warmup + 一次待采集 launch；配合 --launch-skip 1。
+    if (profile_v1 || profile_v2) {
+        for (int launch = 0; launch < 2; ++launch) {
+            if (profile_v1) {
+                flash_attn_kernel<<<grid_fa, 32, smem_v1>>>(
+                    d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale);
+            } else {
+                flash_attn_v2_kernel<<<grid_fa, 256, smem_v2>>>(
+                    d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale);
+            }
+        }
+        cudaDeviceSynchronize();
+        printf("NCU target completed: %s\n", profile_v1 ? "flash_attn_kernel" : "flash_attn_v2_kernel");
+        delete[] h_Q; delete[] h_K; delete[] h_V; delete[] h_ref; delete[] h_out;
+        cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_O);
+        return 0;
+    }
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -419,11 +466,8 @@ int main() {
     // -------------------------------------------------------
     // Flash Attention：正确性 + 计时
     // -------------------------------------------------------
-    int    grid_fa  = (SEQ_LEN + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    size_t smem_size = 3 * BLOCK_SIZE * HEAD_DIM * sizeof(float);
-
     auto run_flash = [&]() {
-        flash_attn_kernel<<<grid_fa, BLOCK_SIZE, smem_size>>>(
+        flash_attn_kernel<<<grid_fa, 32, smem_v1>>>(
             d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale);
     };
 
@@ -440,6 +484,22 @@ int main() {
     cudaEventElapsedTime(&ms, start, stop);
     double flash_ms = ms / RUNS;
 
+    auto run_flash_v2 = [&]() {
+        flash_attn_v2_kernel<<<grid_fa, 256, smem_v2>>>(
+            d_Q, d_K, d_V, d_O, SEQ_LEN, HEAD_DIM, scale);
+    };
+
+    run_flash_v2(); cudaDeviceSynchronize();
+    cudaMemcpy(h_out, d_O, total * sizeof(float), cudaMemcpyDeviceToHost);
+    bool flash_v2_ok = verify(h_ref, h_out, total);
+
+    cudaEventRecord(start);
+    for (int r = 0; r < RUNS; r++) run_flash_v2();
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    double flash_v2_ms = ms / RUNS;
+
     // -------------------------------------------------------
     // 结果汇总
     // -------------------------------------------------------
@@ -449,8 +509,10 @@ int main() {
     printf("%-20s  %s   %7.4f ms\n", "CPU",          "----", cpu_ms);
     printf("%-20s  %s   %7.4f ms\n", "Naive GPU",    naive_ok ? "PASS" : "FAIL", naive_ms);
     printf("%-20s  %s   %7.4f ms\n", "Flash Attn",   flash_ok ? "PASS" : "FAIL", flash_ms);
+    printf("%-20s  %s   %7.4f ms\n", "Flash Attn V2", flash_v2_ok ? "PASS" : "FAIL", flash_v2_ms);
     printf("  Naive GPU vs CPU:  %.1fx\n", cpu_ms / naive_ms);
     printf("  Flash  vs Naive:   %.1fx\n", naive_ms / flash_ms);
+    printf("  V2 vs V1:          %.1fx\n", flash_ms / flash_v2_ms);
     printf("=================================================================\n");
 
     // Cleanup

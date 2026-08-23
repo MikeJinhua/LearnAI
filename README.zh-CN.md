@@ -15,7 +15,7 @@
 | [matmul](matmul/) | Shared Memory Tiling | 3.70 ms → 2.08 ms，1.78x（N=1024，FP32，single-run 代码基准） |
 | [softmax](softmax/) | 内存合并 + 树形归约 + Online Softmax | Naive 0.415 ms，V2 0.036 ms，V3 0.037 ms（FP32，100 runs avg） |
 | [layernorm](layernorm/) | Shared Memory 树形归约 | GPU LayerNorm 0.038 ms（FP32，100 runs avg；未保留原始 CPU baseline） |
-| [flash_attention](flash_attention/) | Tiling + Online Softmax | CPU 873.34 ms / Naive 21.10 ms / Flash 10.70 ms，Flash vs Naive = 2.0x（FP32，seq=4096, head_dim=64，100 runs avg） |
+| [flash_attention](flash_attention/) | Warp 协作 + Online Softmax | V1 10.4941 ms → V2 5.7011 ms，**1.84x 加速 / 耗时降低 45.7%**（FP32，seq=4096, head_dim=64，100 runs avg） |
 
 > 这份 README 采用最稳妥的主数据：有代码和 benchmark 说明支撑的版本；不把不同测试条件混在同一条结论里。
 
@@ -134,15 +134,14 @@ Online Softmax 核心公式：
 
 ```
 实测结果（seq=4096, head_dim=64，FP32，100 runs avg）：
-  CPU:        873.34 ms
-  Naive GPU:  21.10 ms
-  Flash Attn: 10.70 ms
-  Flash vs Naive: 2.0x
+  Naive GPU:     20.4545 ms
+  Flash Attn V1: 10.4941 ms
+  Flash Attn V2:  5.7011 ms
+  V2 vs V1:       1.84x（耗时降低 45.7%）
+  V2 vs Naive:    3.59x
 ```
 
-理论上，Flash Attention 可以把全局内存流量从 256 MB 降到约 8 MB，约 32x 节省；但在 RTX 3060 上，实际收益只有 2.0x，说明瓶颈已经从“DRAM 中间矩阵搬运”转移到**片上访存管线 / shared memory / LSU 访问模式**。这里不是“失败”，而是**瓶颈上移了一层**：你把大量流量从全局显存搬到了 tile 内的 shared memory 与寄存器重用路径；在这个规模下，片上访存本身已经成为限制因素。
-
-这也解释了：理论上 32x 节省，实测只 2x，原因不在于优化思路错了，而在于它从“全局内存带宽问题”变成了“片上访存/共享内存效率问题”。
+V1 是“一个线程处理一整行 Q”，每个 block 只有一个 warp。V2 改为一个 warp 协作处理 Q 行，每个 block 有 8 个 warp，每个 lane 只保留两个输出维度。这使寄存器从 96 降到 40 registers/thread，dynamic shared memory 从 24KB 降到 16KB/block，Achieved Occupancy 从 7.27% 提高到 60.62%。
 
 → [详细说明](flash_attention/README.md)
 
@@ -156,46 +155,32 @@ Online Softmax 核心公式：
 # 编译加 -lineinfo 支持 source correlation
 nvcc -O2 -arch=sm_86 -lineinfo flash_attn.cu -o flash_attn.exe
 
-# Profiling：同时观察 Flash Attn 与 Naive 的关键 kernel
-ncu --set full ^
-    --kernel-name flash_attn_kernel ^
-    --kernel-name qk_dot_kernel ^
-    --kernel-name softmax_kernel ^
-    --kernel-name sv_dot_kernel ^
-    -o flash_attn_report ^
-    flash_attn.exe
+# V1/V2 分开采集，跳过第一次 warmup launch
+ncu --set full --kernel-name regex:flash_attn_kernel --launch-skip 1 --launch-count 1 ^
+    -o ncu_report\flash_v1 flash_attn.exe --profile-v1
+ncu --set full --kernel-name regex:flash_attn_v2_kernel --launch-skip 1 --launch-count 1 ^
+    -o ncu_report\flash_v2 flash_attn.exe --profile-v2
 
 ncu-ui flash_attn_report.ncu-rep
 ```
 
-### 关键 NCU 指标（Flash Attention kernel）
+### 关键 NCU 指标（V1 对比 V2）
 
-| 指标 | 结果 |
-|------|------|
-| L2 Cache Hit Rate | 95.15% |
-| Achieved Occupancy | 90.82% |
-| Memory Busy | 99.73% |
-| Compute Throughput | 22.55% |
+| 指标 | V1 | V2 |
+|------|---:|---:|
+| NCU Duration | 11.05 ms | 6.90 ms |
+| Compute Throughput | 10.56% | 74.41% |
+| DRAM Throughput | 0.43% | 3.63% |
+| Theoretical Occupancy | 8.33% | 83.33% |
+| Achieved Occupancy | 7.27% | 60.62% |
+| Eligible Warps / Scheduler | 0.12 | 2.35 |
+| No Eligible | 88.22% | 30.19% |
+| Registers / Thread | 96 | 40 |
+| Dynamic Shared Memory / Block | 24.58KB | 16.38KB |
 
-这四个数字的真实含义是：
+V1 的核心问题是低并行度导致的 latency-bound：每 block 只有一个 warp，Scheduler 有 88.22% 的时间找不到 eligible warp，无法隐藏依赖和 shared-memory 延迟。V2 用 8 个 warp/block、warp shuffle dot-product 归约和更少的每线程状态直接对应这些证据。
 
-- **Memory Busy = 99.73%**，**Compute Throughput = 22.55%**，这是一条典型的 **memory-bound** 信号。
-- **L2 Hit Rate = 95.15%**，说明这些访存没有打到 DRAM，而是被扔进了更高层次的片上缓存/共享内存路径。
-
-所以，这个项目最关键的结论不是“Flash Attention 仍然是 pure DRAM memory-bound”，而是：
-
-> **Flash Attention 没有消除访存瓶颈，而是把它从 DRAM 搬到了片上访存管线。**
-
-也就是说，理论上的 32x 节省只计算了全局内存流量，却没有把 tile 内部大量的 shared memory load/store 与寄存器重用计入；所以 32x → 2.0x 的落差，是“瓶颈上移”而不是“优化无效”。
-
-**这个判断有数据支撑：**
-
-- 99.73% 的 Memory Busy 证明“访存是主瓶颈”
-- 95.15% 的 L2 命中证明“这不是 DRAM 这层的内存吸收问题，而是片上访存路径的吞吐限制”
-- 90.82% 的 Achieved Occupancy 说明 occupancy 不是主限制，而是 shared memory / LSU / register reuse 才是关键
-- 22.55% 的 Compute Throughput 说明 ALU 没有被高峰值占满；即使算力存在剩余，程序仍被访存管线卡住
-
-这里的结论非常明确：**不是 compute-bound，也不是“看起来像 memory-bound 就都一样”**，而是“瓶颈从 DRAM 转移到片上访存管线”。这个结论比“理论 roofline 说法更符合你手上的 NCU 实测”。
+> 旧文档中的 `99.73% Memory Throughput / 90.82% Occupancy` 实际属于 naive `qk_dot_kernel`，不能归因于 Flash V1 或 V2。
 
 ### 需要说明的缺失项
 
@@ -205,9 +190,9 @@ ncu-ui flash_attn_report.ncu-rep
 
 ### 性能结论（总结）
 
-1. 对于 Flash Attention，**收益真实存在**：CPU 873.34 ms → Naive 21.10 ms → Flash 10.70 ms，约 2.0x。  
-2. 对于 NCU 来看，**瓶颈不是 compute-bound，而是从 DRAM 转移到了片上访存路径**。  
-3. 我们已在仓库中保留关键 NCU 证据与截图，且不在公开结论中扩展到无根据的定性描述。  
+1. Flash Attention V2 从 10.4941 ms 降到 5.7011 ms，加速 1.84x，耗时降低 45.7%。
+2. NCU 表明 V1 的主要问题是 eligible warp 不足导致的 latency-bound；V2 通过提高并行度和 occupancy 解决它。
+3. 我们已在仓库中保留关键 NCU 证据与截图，且不在公开结论中扩展到无根据的定性描述。
 4. 缺失项直接写“未测 / 未保留”，这比编造更可信，也更适合 GitHub 和简历展示。
 
 ---

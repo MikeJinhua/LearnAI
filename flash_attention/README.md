@@ -35,9 +35,15 @@ flash_attn.exe
 
 | 方案 | 正确性 | 平均耗时 | 对比 |
 |---|---|---|---|
-| CPU | — | 873.34 ms | baseline |
-| Naive GPU | PASS | 21.10 ms | 41.4x vs CPU |
-| Flash Attn | PASS | 10.70 ms | **2.0x vs Naive GPU** |
+| Naive GPU | PASS | 20.4545 ms | baseline |
+| Flash Attn V1 | PASS | 10.4941 ms | **1.95x vs Naive GPU** |
+| Flash Attn V2 | PASS | 5.7011 ms | **1.84x vs V1；3.59x vs Naive GPU** |
+
+V2 使用 8 个 warp/block，每个 warp 协作处理 Q 行：32 个 lane 并行完成 64 维 dot product，
+并分别持有两个输出维度。它仍让每个 block 处理 32 行 Q，从而保持 V1 的 K/V tile 跨行复用粒度。
+编译器资源统计从 V1 的 96 registers/thread 降到 V2 的 40 registers/thread，shared memory
+也从 24 KB/block 降到 16 KB/block（RTX 3060，FP32，seq=4096，head_dim=64，100 runs）。
+从 V1 的 10.4941 ms 降到 V2 的 5.7011 ms，等价于 **1.84x 加速**，或 **耗时降低 45.7%**。
 
 ---
 
@@ -120,6 +126,16 @@ O = o_acc / l
 
 ## NCU Profiling（性能分析完成）
 
+> **数据更正：** 下方旧截图和 `99.73% Memory Throughput / 22.55% Compute Throughput /
+> 90.82% Occupancy` 实际选中的是 naive 路径的 `qk_dot_kernel`，不能归因于
+> `flash_attn_kernel`。真正的 V1 Flash kernel 实测为：Compute Throughput 10.36%、
+> Memory Throughput 53.20%、L1/TEX Throughput 75.60%、L2 Throughput 0.86%、
+> DRAM Throughput 0.20%、Theoretical Occupancy 8.33%、Achieved Occupancy 7.25%，
+> 且 Scheduler 的 No Eligible 为 88.22%、Short Scoreboard 约占指令间隔的 66%。
+> 因此 V1 是低并行度造成的 latency-bound，不是 DRAM bandwidth-bound。
+> V1/V2 的正确单次采集方法见 `RUN_NCU_PROFILING.md`；下方旧结论仅保留作错误数据选择案例，
+> 不应继续作为 Flash kernel 的性能结论引用。
+
 已完成基准测试和理论分析。关键指标推导如下：
 
 ### 内存优化量化
@@ -141,87 +157,29 @@ O = o_acc / l
 
 ### 实测性能数据
 
-| 指标 | Naive GPU | Flash Attention | 改善 |
-|------|-----------|-----------------|------|
-| 执行时间 | 21.10 ms | 10.70 ms | **2.0x** |
-| 理论内存流量 | 256 MB | 8 MB | **32x** |
-| 实际加速 | baseline | 2.0x | 受其他因素限制 |
+| 指标 | Naive GPU | Flash V1 | Flash V2 |
+|------|---:|---:|---:|
+| 执行时间 | 20.4545 ms | 10.4941 ms | 5.7011 ms |
+| 相对 V1 | — | baseline | **1.84x** |
+| 相对 Naive | baseline | 1.95x | **3.59x** |
+| 正确性 | PASS | PASS | PASS |
 
-### 瓶颈分析
+### V1 瓶颈与 V2 修改的证据链
 
-Flash Attention 虽然减少了 32x 的全局内存流量，但实现的加速只有 2.0x，原因：
+| NCU 指标 | V1 | V2 | 含义 |
+|------|---:|---:|------|
+| Compute Throughput | 10.56% | 74.41% | V2 更能持续发射计算指令 |
+| DRAM Throughput | 0.43% | 3.63% | V1 不是 DRAM 带宽打满 |
+| Theoretical Occupancy | 8.33% | 83.33% | V1 受 block 并行度和资源限制 |
+| Achieved Occupancy | 7.27% | 60.62% | V2 有更多 active warp 隐藏延迟 |
+| Eligible Warps / Scheduler | 0.12 | 2.35 | V2 调度器更少无事可做 |
+| No Eligible | 88.22% | 30.19% | V1 的关键 latency-bound 证据 |
+| Registers / Thread | 96 | 40 | V2 降低每线程状态 |
+| Dynamic Shared Memory / Block | 24.58KB | 16.38KB | V2 不再把 Q tile 放入 shared memory |
 
-1. **Shared Memory 限制**
-   - RTX 3060 每个 SM 只有 96KB shared memory
-   - 16×16×4 tiles 用 ~4KB，开销小，但 bank conflict 有损耗
+V1 每 block 只有 32 threads，即一个 warp；每线程串行计算一整行 dot product，并保留 64 维输出累加器。V2 改为 256 threads/block，由一个 warp 协作处理 Q 行，用 `__shfl_down_sync` 归约 dot product，每个 lane 只保留两个 Q/O 维度。因此这不是“凭经验调 block size”，而是直接针对 NCU 显示的低 occupancy 和缺少 eligible warp。
 
-2. **仍然是内存瓶颈**
-   - 即使只有 8MB 全局流量，仍需从 DRAM 读取
-   - seq=4096 的计算量 (~1B FLOP) 已接近 peak 计算能力
-
-3. **Kernel Launch 开销**
-   - 单 kernel 节省了启动开销，但相对整体 10.7ms 影响不大
-
-4. **SM_86 (RTX 3060) 局限性**
-   - 相比新一代 GPU (Hopper, Ada) 内存带宽相对较低
-   - 更新的架构能达到 4-8x 加速
-
-### 性能预期（其他硬件）
-
-| GPU | 理论带宽 | 预期加速倍数 |
-|-----|----------|-------------|
-| RTX 3060 | 360 GB/s | 2.0x ✓ 实测 |
-| RTX 4090 | 1440 GB/s | 3-4x |
-| A100 | 2039 GB/s | 4-5x |
-
-### NCU 实测性能指标
-
-已完成 Nsight Compute 分析。以下是 RTX 3060 上的实测数据：
-
-#### Memory Workload Analysis（qk_dot_kernel）
-
-| 指标 | 数值 |
-|------|------|
-| **L2 Cache Hit Rate** | **95.15%** |
-| Memory Throughput | 7.19 GB/s |
-| L1/TEX Hit Rate | 98.15% |
-| Memory Busy | 99.73% |
-| DRAM Active Cycles | 1,773,730.67 |
-
-#### GPU Speed Of Light（Roofline 分析）
-
-| 指标 | 数值 | 含义 |
-|------|------|------|
-| **Compute Throughput** | **22.55%** | 计算资源未充分利用 |
-| **Memory Throughput** | **99.73%** | ⚠ 内存严重饱和（Memory Bound）|
-| Max Bandwidth | 22.55% | 相对理论峰值计算性能 |
-
-**Roofline 结论：** Flash Attention 仍受**内存带宽限制**，不是计算限制。这符合设计目标——减少全局内存访问（已做到 32x 理论节省），但 RTX 3060 的 360 GB/s 内存带宽仍是瓶颈。
-
-#### SM 占用率（Occupancy Analysis）
-
-| 指标 | 数值 |
-|------|------|
-| **Achieved Occupancy** | **90.82%** |
-| Theoretical Occupancy | 100% |
-| Achieved Active Warps Per SM | 43.59 warps |
-
-**占用率分析：** 90.82% 的占用率接近理论值，说明 SM 资源配置良好，但内存 I/O 成为真正的瓶颈。
-
-#### 性能诊断总结
-
-1. **High L2 Cache Hit Rate（95.15%）** ✓ 
-   - Shared memory 和片上缓存优化有效
-   - 表示多数数据重用能被 L2 缓存命中
-
-2. **Memory Bound（99.73% Memory Busy）** ⚠
-   - 全局内存带宽饱和
-   - 即使减少了 32x 的全局流量，仍受限于 360 GB/s 峰值
-   - 新 GPU（A100/H100：>1.5 TB/s）能更好发挥 Flash Attention 优势
-
-3. **低计算占用率（22.55%）** ✓
-   - 符合预期——Flash Attention 本质就是**算术密度优化**，不是 FLOPs 优化
-   - 通过 online softmax 减少寄存器压力、降低内存流量
+> `99.73% Memory Throughput / 90.82% Occupancy` 是 naive `qk_dot_kernel` 的指标，不是 Flash V1/V2 的指标。
 
 ### 如何查看完整的 NCU 报告
 
